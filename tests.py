@@ -2541,10 +2541,91 @@ def search_items_by_name_or_id(guild_id: int, query: str) -> list[dict]:
 
     # Если по ID не нашли или query не число, ищем по имени
     search_query = f"%{query.lower()}%"
-    c.execute("SELECT * FROM items WHERE guild_id = ? AND name_lower LIKE ? LIMIT 10", (guild_id, search_query))
+    c.execute(
+        "SELECT * FROM items WHERE guild_id = ? AND name_lower LIKE ? ORDER BY name_lower",
+        (guild_id, search_query)
+    )
     items = [dict(row) for row in c.fetchall()]
     conn.close()
     return items
+
+
+class ItemSelectionView(disnake.ui.View):
+    def __init__(self, ctx: commands.Context, items: list[dict], timeout: int = 60, per_page: int = 10):
+        super().__init__(timeout=timeout)
+        self.ctx = ctx
+        self.items = items
+        self.per_page = max(1, per_page)
+        self.page = 0
+        self.max_page = max(0, (len(items) - 1) // self.per_page) if items else 0
+        self.author_id = ctx.author.id if ctx.author else None
+        self.message: Optional[disnake.Message] = None
+        self._sync_buttons_state()
+
+    async def interaction_check(self, interaction: disnake.MessageInteraction) -> bool:
+        if self.author_id and interaction.user.id != self.author_id:
+            await interaction.response.send_message("Управлять списком может только инициатор.", ephemeral=True)
+            return False
+        return True
+
+    def _sync_buttons_state(self):
+        for child in self.children:
+            if isinstance(child, disnake.ui.Button):
+                if child.custom_id == "item_select_prev":
+                    child.disabled = self.page <= 0
+                elif child.custom_id == "item_select_next":
+                    child.disabled = self.page >= self.max_page
+
+    def _page_slice(self) -> list[tuple[int, dict]]:
+        start = self.page * self.per_page
+        end = start + self.per_page
+        return list(enumerate(self.items[start:end], start=start + 1))
+
+    def build_embed(self) -> disnake.Embed:
+        description_lines = [
+            "Найдено несколько предметов. Введите номер нужного вам предмета в чат.",
+            "Используйте кнопки ниже, чтобы листать совпадения.",
+            ""
+        ]
+
+        page_items = self._page_slice()
+        if not page_items:
+            description_lines.append("Совпадения отсутствуют.")
+        else:
+            for index, item in page_items:
+                description_lines.append(f"**{index}.** {item['name']} (ID: {item['id']})")
+
+        embed = disnake.Embed(
+            title="Выберите предмет",
+            description="\n".join(description_lines),
+            color=disnake.Color.orange()
+        )
+
+        total_pages = self.max_page + 1 if self.items else 1
+        embed.set_footer(text=f"Страница {self.page + 1} из {total_pages} • У вас есть ограниченное время на ответ.")
+        return embed
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            if isinstance(child, disnake.ui.Button):
+                child.disabled = True
+        if self.message:
+            with contextlib.suppress(disnake.HTTPException):
+                await self.message.edit(view=self)
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary, custom_id="item_select_prev")
+    async def prev_page(self, button: disnake.ui.Button, interaction: disnake.MessageInteraction):
+        if self.page > 0:
+            self.page -= 1
+        self._sync_buttons_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @disnake.ui.button(label="Вперёд", style=disnake.ButtonStyle.secondary, custom_id="item_select_next")
+    async def next_page(self, button: disnake.ui.Button, interaction: disnake.MessageInteraction):
+        if self.page < self.max_page:
+            self.page += 1
+        self._sync_buttons_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 async def resolve_item_by_user_input(
     ctx: commands.Context,
@@ -2564,17 +2645,10 @@ async def resolve_item_by_user_input(
     if len(results) == 1:
         return results[0], None
 
-    description = "Найдено несколько предметов. Введите номер нужного вам предмета в чат.\n\n"
-    for i, item in enumerate(results, 1):
-        description += f"**{i}.** {item['name']} (ID: {item['id']})\n"
-    
-    choice_embed = disnake.Embed(
-        title="Выберите предмет",
-        description=description,
-        color=disnake.Color.orange()
-    ).set_footer(text=f"У вас есть {timeout} секунд на ответ.")
-
-    prompt_message = await ctx.channel.send(embed=choice_embed)
+    view = ItemSelectionView(ctx, results, timeout=timeout)
+    choice_embed = view.build_embed()
+    prompt_message = await ctx.channel.send(embed=choice_embed, view=view)
+    view.message = prompt_message
 
     def check(m: disnake.Message):
         return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
@@ -2589,6 +2663,7 @@ async def resolve_item_by_user_input(
                 selected_item = results[int(msg.content) - 1]
                 with contextlib.suppress(disnake.HTTPException):
                     await prompt_message.delete()
+                view.stop()
                 return selected_item, None
             else:
                 await ctx.channel.send(f"Неверный ввод. Пожалуйста, введите число от 1 до {len(results)}.", delete_after=10)
@@ -2596,10 +2671,12 @@ async def resolve_item_by_user_input(
         except asyncio.TimeoutError:
             with contextlib.suppress(disnake.HTTPException):
                 await prompt_message.delete()
+            view.stop()
             return None, "Время на выбор истекло."
 
     with contextlib.suppress(disnake.HTTPException):
         await prompt_message.delete()
+    view.stop()
     return None, "Вы исчерпали все попытки выбора."
 
 # ЗАМЕНИТЬ ВЕСЬ БЛОК ОТ class BasicInfoModal ДО КОНЦА class CreateItemWizard
