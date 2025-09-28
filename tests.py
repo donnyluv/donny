@@ -22,7 +22,7 @@ intents = disnake.Intents.all()
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-MONEY_EMOJI = "<:kto_udalit_ban:1400415456392642572>"
+MONEY_EMOJI = ":euro:"
 CURRENCY = "€"
 SHOW_BALANCE_FIELD = True
 
@@ -230,9 +230,11 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS role_incomes (
             guild_id INTEGER,
             role_id INTEGER,
-            income_type TEXT NOT NULL,       -- 'money' | 'items'
-            money_amount INTEGER DEFAULT 0,  -- если income_type='money'
-            items_json TEXT,                 -- JSON: [{"item_id": int, "qty": int}, ...] если income_type='items'
+            income_type TEXT NOT NULL,            -- 'money' | 'items'
+            money_amount INTEGER DEFAULT 0,       -- абсолютное значение суммы/процента
+            money_is_percent INTEGER NOT NULL DEFAULT 0,
+            money_is_debit INTEGER NOT NULL DEFAULT 0,
+            items_json TEXT,                      -- JSON: [{"item_id": int, "qty": int}, ...] если income_type='items'
             cooldown_seconds INTEGER NOT NULL DEFAULT 86400,
             PRIMARY KEY (guild_id, role_id)
         )
@@ -336,6 +338,10 @@ def ensure_role_incomes_extra_columns():
         c.execute("ALTER TABLE role_incomes ADD COLUMN created_by INTEGER")
     if "created_ts" not in cols:
         c.execute("ALTER TABLE role_incomes ADD COLUMN created_ts INTEGER")
+    if "money_is_percent" not in cols:
+        c.execute("ALTER TABLE role_incomes ADD COLUMN money_is_percent INTEGER NOT NULL DEFAULT 0")
+    if "money_is_debit" not in cols:
+        c.execute("ALTER TABLE role_incomes ADD COLUMN money_is_debit INTEGER NOT NULL DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -5101,7 +5107,12 @@ def _ri_params_to_lines(guild: disnake.Guild, ri: dict) -> list[str]:
     typ = "💰 Деньги" if ri["income_type"] == "money" else "📦 Предметы"
     lines.append(f"Тип: {typ}")
     if ri["income_type"] == "money":
-        lines.append(f"Сумма за сбор: {format_number(int(ri['money_amount'] or 0))} {MONEY_EMOJI}")
+        income = money_income_display(
+            ri.get("money_amount", 0),
+            is_percent=ri.get("money_is_percent", False),
+            is_debit=ri.get("money_is_debit", False)
+        )
+        lines.append(f"Денежный доход: {income}")
     else:
         lines.append(f"Предметы: {_ri_items_to_str(guild, ri.get('items') or [])}")
     lines.append(f"Кулдаун: {format_seconds(int(ri['cooldown_seconds'] or 0))}")
@@ -5127,9 +5138,22 @@ def _ri_diff_lines(guild: disnake.Guild, before: Optional[dict], after: Optional
         a = "💰 Деньги" if after.get("income_type") == "money" else "📦 Предметы"
         lines.append(f"Тип: {b} → {a}")
 
-    # Сумма (имеет смысл для money)
-    if int(before.get("money_amount") or 0) != int(after.get("money_amount") or 0):
-        lines.append(f"Сумма: {format_number(int(before.get('money_amount') or 0))} → {format_number(int(after.get('money_amount') or 0))}")
+    # Сумма/процент
+    b_money = before.get("income_type") == "money"
+    a_money = after.get("income_type") == "money"
+    if b_money or a_money:
+        b_text = money_income_display(
+            before.get("money_amount", 0),
+            is_percent=before.get("money_is_percent", False),
+            is_debit=before.get("money_is_debit", False)
+        ) if b_money else "—"
+        a_text = money_income_display(
+            after.get("money_amount", 0),
+            is_percent=after.get("money_is_percent", False),
+            is_debit=after.get("money_is_debit", False)
+        ) if a_money else "—"
+        if b_text != a_text:
+            lines.append(f"Денежный доход: {b_text} → {a_text}")
 
     # Предметы (строковое представление)
     b_items = _ri_items_to_str(guild, before.get("items") or [])
@@ -5474,7 +5498,16 @@ def db_get_role_incomes(guild_id: int) -> list[dict]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
     c.execute("""
-        SELECT role_id, income_type, money_amount, items_json, cooldown_seconds, created_by, created_ts
+        SELECT
+            role_id,
+            income_type,
+            money_amount,
+            money_is_percent,
+            money_is_debit,
+            items_json,
+            cooldown_seconds,
+            created_by,
+            created_ts
         FROM role_incomes
         WHERE guild_id = ?
         ORDER BY role_id
@@ -5484,9 +5517,9 @@ def db_get_role_incomes(guild_id: int) -> list[dict]:
     result = []
     for r in rows:
         items = []
-        if r[1] == "items" and r[3]:
+        if r[1] == "items" and r[5]:
             try:
-                parsed = json.loads(r[3])
+                parsed = json.loads(r[5])
                 if isinstance(parsed, list):
                     items = [{"item_id": int(x["item_id"]), "qty": int(x["qty"])} for x in parsed]
             except Exception:
@@ -5495,10 +5528,12 @@ def db_get_role_incomes(guild_id: int) -> list[dict]:
             "role_id": int(r[0]),
             "income_type": r[1],
             "money_amount": int(r[2] or 0),
+            "money_is_percent": bool(int(r[3] or 0)),
+            "money_is_debit": bool(int(r[4] or 0)),
             "items": items,
-            "cooldown_seconds": int(r[4] or 0),
-            "created_by": int(r[5]) if r[5] is not None else None,
-            "created_ts": int(r[6]) if r[6] is not None else None,
+            "cooldown_seconds": int(r[6] or 0),
+            "created_by": int(r[7]) if r[7] is not None else None,
+            "created_ts": int(r[8]) if r[8] is not None else None,
         })
     return result
 
@@ -5506,7 +5541,15 @@ def db_get_role_income(guild_id: int, role_id: int) -> Optional[dict]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
     c.execute("""
-        SELECT income_type, money_amount, items_json, cooldown_seconds, created_by, created_ts
+        SELECT
+            income_type,
+            money_amount,
+            money_is_percent,
+            money_is_debit,
+            items_json,
+            cooldown_seconds,
+            created_by,
+            created_ts
         FROM role_incomes
         WHERE guild_id = ? AND role_id = ?
     """, (guild_id, role_id))
@@ -5515,9 +5558,9 @@ def db_get_role_income(guild_id: int, role_id: int) -> Optional[dict]:
     if not row:
         return None
     items = []
-    if row[0] == "items" and row[2]:
+    if row[0] == "items" and row[4]:
         try:
-            parsed = json.loads(row[2])
+            parsed = json.loads(row[4])
             if isinstance(parsed, list):
                 items = [{"item_id": int(x["item_id"]), "qty": int(x["qty"])} for x in parsed]
         except Exception:
@@ -5526,10 +5569,12 @@ def db_get_role_income(guild_id: int, role_id: int) -> Optional[dict]:
         "role_id": role_id,
         "income_type": row[0],
         "money_amount": int(row[1] or 0),
+        "money_is_percent": bool(int(row[2] or 0)),
+        "money_is_debit": bool(int(row[3] or 0)),
         "items": items,
-        "cooldown_seconds": int(row[3] or 0),
-        "created_by": int(row[4]) if row[4] is not None else None,
-        "created_ts": int(row[5]) if row[5] is not None else None,
+        "cooldown_seconds": int(row[5] or 0),
+        "created_by": int(row[6]) if row[6] is not None else None,
+        "created_ts": int(row[7]) if row[7] is not None else None,
     }
 
 def db_upsert_role_income(
@@ -5539,7 +5584,10 @@ def db_upsert_role_income(
     money_amount: int,
     items: list[dict],
     cooldown_seconds: int,
-    created_by: Optional[int] = None
+    created_by: Optional[int] = None,
+    *,
+    money_is_percent: bool = False,
+    money_is_debit: bool = False
 ):
     import time as _time
     conn = sqlite3.connect(get_db_path())
@@ -5549,16 +5597,40 @@ def db_upsert_role_income(
 
     # сохраняем created_by/created_ts только если они ещё не установлены (COALESCE)
     c.execute(f"""
-        INSERT INTO role_incomes (guild_id, role_id, income_type, money_amount, items_json, cooldown_seconds, created_by, created_ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO role_incomes (
+            guild_id,
+            role_id,
+            income_type,
+            money_amount,
+            money_is_percent,
+            money_is_debit,
+            items_json,
+            cooldown_seconds,
+            created_by,
+            created_ts
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guild_id, role_id) DO UPDATE SET
             income_type = excluded.income_type,
             money_amount = excluded.money_amount,
+            money_is_percent = excluded.money_is_percent,
+            money_is_debit = excluded.money_is_debit,
             items_json = excluded.items_json,
             cooldown_seconds = excluded.cooldown_seconds,
             created_by = COALESCE(role_incomes.created_by, excluded.created_by),
             created_ts = COALESCE(role_incomes.created_ts, excluded.created_ts)
-    """, (guild_id, role_id, income_type, int(money_amount or 0), items_json, int(cooldown_seconds or 0), created_by, created_ts))
+    """, (
+        guild_id,
+        role_id,
+        income_type,
+        int(money_amount or 0),
+        1 if money_is_percent else 0,
+        1 if money_is_debit else 0,
+        items_json,
+        int(cooldown_seconds or 0),
+        created_by,
+        created_ts
+    ))
     conn.commit()
     conn.close()
 
@@ -5666,13 +5738,99 @@ def parse_duration_to_seconds(text: str) -> Optional[int]:
         return None
     return total
 
+# ===== Вспомогательные функции для денежных доходов ролей =====
+
+def parse_money_income_input(text: str) -> tuple[int, bool, bool]:
+    """Парсит ввод суммы/процента для доходной роли.
+
+    Возвращает кортеж ``(value, is_percent, is_debit)`` где ``value`` — абсолютное
+    значение (целое > 0). ``is_percent`` указывает, что введено значение в процентах,
+    ``is_debit`` — что это списание (знак «-»).
+    """
+
+    raw = (text or "").strip().lower().replace(" ", "")
+    if not raw:
+        raise ValueError("Введите сумму или процент.")
+
+    is_percent = raw.endswith("%")
+    if is_percent:
+        raw = raw[:-1]
+    if not raw:
+        raise ValueError("Введите значение перед знаком процента.")
+
+    sign = 1
+    if raw[0] in "+-":
+        sign = -1 if raw[0] == "-" else 1
+        raw = raw[1:]
+    if not raw:
+        raise ValueError("Введите числовое значение.")
+
+    if is_percent:
+        value = safe_int(raw, name="Процент", min_v=0, max_v=1000)
+    else:
+        value = safe_int(raw, name="Сумма", min_v=0)
+
+    if value <= 0:
+        raise ValueError("Значение должно быть больше 0.")
+
+    return value, is_percent, sign < 0
+
+
+def money_income_input_value(amount: int, *, is_percent: bool, is_debit: bool) -> str:
+    """Строка для подстановки в модалку (редактирование)."""
+    amount = abs(int(amount or 0))
+    if amount <= 0:
+        return ""
+    sign = "-" if is_debit else ""
+    suffix = "%" if is_percent else ""
+    return f"{sign}{amount}{suffix}"
+
+
+def money_income_display(
+    amount: int,
+    *,
+    is_percent: bool,
+    is_debit: bool,
+    include_suffix: bool = True,
+    percent_suffix: str = "от денежного дохода сбора"
+) -> str:
+    """Форматирует настройки денежного дохода для отображения."""
+
+    amount = abs(int(amount or 0))
+    if is_percent:
+        if amount == 0:
+            base = "0%"
+        else:
+            sign = "-" if is_debit else "+"
+            base = f"{sign}{amount}%"
+        return f"{base} {percent_suffix}" if include_suffix else base
+
+    if amount == 0:
+        return f"0 {MONEY_EMOJI}"
+    sign = "-" if is_debit else "+"
+    return f"{sign}{format_number(abs(amount))} {MONEY_EMOJI}"
+
+
+def signed_money_amount(amount: int) -> str:
+    """Возвращает сумму с явным знаком для фактического начисления/списания."""
+
+    if amount == 0:
+        return f"0 {MONEY_EMOJI}"
+    sign = "+" if amount > 0 else "-"
+    return f"{sign}{format_number(abs(amount))} {MONEY_EMOJI}"
+
 # ===== Вью и модалки для настройки доходных ролей =====
 
 def _fmt_income_line(guild: disnake.Guild, ri: dict) -> str:
     role_mention = f"<@&{ri['role_id']}>"
     cd = format_seconds(ri['cooldown_seconds'])
     if ri["income_type"] == "money":
-        return f"{role_mention} • Тип: 💰 Деньги • Доход: {format_number(ri['money_amount'])} {MONEY_EMOJI} • Кулдаун: {cd}"
+        income = money_income_display(
+            ri.get("money_amount", 0),
+            is_percent=ri.get("money_is_percent", False),
+            is_debit=ri.get("money_is_debit", False)
+        )
+        return f"{role_mention} • Тип: 💰 Деньги • Доход: {income} • Кулдаун: {cd}"
     else:
         id2name = items_id_to_name_map(guild)
         if not ri["items"]:
@@ -5754,16 +5912,31 @@ def build_role_income_embed(guild: disnake.Guild, invoker: disnake.Member) -> di
     return e
 
 class RIMoneyModal(disnake.ui.Modal):
-    def __init__(self, view_ref, mode: str, role_id: int, money_amount: int = 0, cooldown_seconds: int = 86400):
+    def __init__(
+        self,
+        view_ref,
+        mode: str,
+        role_id: int,
+        money_amount: int = 0,
+        cooldown_seconds: int = 86400,
+        *,
+        money_is_percent: bool = False,
+        money_is_debit: bool = False
+    ):
         # mode: 'add' | 'edit'
+        amount_value = money_income_input_value(
+            money_amount,
+            is_percent=money_is_percent,
+            is_debit=money_is_debit
+        )
         components = [
             disnake.ui.TextInput(
-                label="Сумма за один !collect (целое > 0)",
+                label="Сумма/процент за один !collect",
                 custom_id="ri_money",
                 style=disnake.TextInputStyle.short,
                 required=True,
-                placeholder="например: 250",
-                value=str(money_amount) if money_amount > 0 else ""
+                placeholder="Например: 250, -1000, 15%, -10%",
+                value=amount_value
             ),
             disnake.ui.TextInput(
                 label="Кулдаун (пример: 3600, 1h 30m, 00:45:00)",
@@ -5780,10 +5953,10 @@ class RIMoneyModal(disnake.ui.Modal):
         self.mode = mode
 
     async def callback(self, inter: disnake.ModalInteraction):
-        money_raw = (inter.text_values.get("ri_money") or "").replace(" ", "")
+        money_raw = inter.text_values.get("ri_money") or ""
         cd_raw = (inter.text_values.get("ri_cd") or "").strip()
         try:
-            money_val = safe_int(money_raw, name="Сумма", min_v=1)
+            money_val, is_percent, is_debit = parse_money_income_input(money_raw)
         except ValueError as e:
             return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
         cd = parse_duration_to_seconds(cd_raw)
@@ -5800,7 +5973,9 @@ class RIMoneyModal(disnake.ui.Modal):
             money_val,
             [],
             cd,
-            created_by=(inter.user.id if self.mode == "add" else None)
+            created_by=(inter.user.id if self.mode == "add" else None),
+            money_is_percent=is_percent,
+            money_is_debit=is_debit
         )
 
         # ДОБАВЛЕНО: снимем состояние "после" и отправим лог
@@ -6061,7 +6236,9 @@ class RoleIncomeView(disnake.ui.View):
                 await i.response.send_modal(RIMoneyModal(
                     self, "edit", chosen["role_id"],
                     money_amount=current.get("money_amount", 0),
-                    cooldown_seconds=current.get("cooldown_seconds", 86400)
+                    cooldown_seconds=current.get("cooldown_seconds", 86400),
+                    money_is_percent=current.get("money_is_percent", False),
+                    money_is_debit=current.get("money_is_debit", False)
                 ))
             else:
                 await i.response.send_modal(RIItemsModal(
@@ -7431,7 +7608,12 @@ def _build_income_list_embed(guild: disnake.Guild, data: list[dict], page: int, 
 
             # 2) Сумма или Ресурсы
             if ri["income_type"] == "money":
-                second = f"Сумма: {format_number(int(ri['money_amount'] or 0))}"
+                income = money_income_display(
+                    ri.get("money_amount", 0),
+                    is_percent=ri.get("money_is_percent", False),
+                    is_debit=ri.get("money_is_debit", False)
+                )
+                second = f"Сумма: {income}"
             else:
                 if not ri["items"]:
                     second = "Ресурсы: —"
@@ -8702,19 +8884,28 @@ async def collect_cmd(ctx: commands.Context):
 
     # Выдаём доход
     total_money = 0
-    money_lines = []
-    item_lines = []
+    money_lines: list[str] = []
+    item_lines: list[str] = []
     id2name = items_id_to_name_map(ctx.guild)
+    money_results: list[dict] = []  # {'ri': dict, 'amount': int, 'base': Optional[int]}
+    percent_indices: list[int] = []
 
     for ri in ready:
         if ri["income_type"] == "money":
-            amt = int(ri["money_amount"] or 0)
-            if amt > 0:
-                total_money += amt
-                money_lines.append(f"<@&{ri['role_id']}> → {format_number(amt)} {MONEY_EMOJI} (cash)")
+            base_value = abs(int(ri.get("money_amount") or 0))
+            is_percent = bool(ri.get("money_is_percent"))
+            is_debit = bool(ri.get("money_is_debit"))
+            if is_percent:
+                percent_indices.append(len(money_results))
+                money_results.append({"ri": ri, "amount": 0, "base": None})
+            else:
+                signed = -base_value if (is_debit and base_value) else base_value
+                total_money += signed
+                money_results.append({"ri": ri, "amount": signed, "base": None})
         else:
             # Предметы
             if not ri["items"]:
+                db_set_ri_last_ts(ctx.guild.id, ri["role_id"], member.id, now)
                 continue
             sub_lines = []
             for it in ri["items"]:
@@ -8733,7 +8924,54 @@ async def collect_cmd(ctx: commands.Context):
         # зафиксировать кулдаун для этой роли
         db_set_ri_last_ts(ctx.guild.id, ri["role_id"], member.id, now)
 
-    if total_money > 0:
+    percent_base = sum(entry["amount"] for entry in money_results if entry["amount"] > 0)
+    if percent_base < 0:
+        percent_base = 0
+
+    for idx in percent_indices:
+        entry = money_results[idx]
+        ri = entry["ri"]
+        pct_value = abs(int(ri.get("money_amount") or 0))
+        is_debit = bool(ri.get("money_is_debit"))
+        computed = 0
+        if pct_value > 0 and percent_base > 0:
+            base_mult = percent_base * pct_value
+            computed = base_mult // 100
+            if base_mult % 100 >= 50:
+                computed += 1
+        signed = -computed if (is_debit and computed) else computed
+        total_money += signed
+        entry["amount"] = signed
+        entry["base"] = percent_base
+
+    for entry in money_results:
+        ri = entry["ri"]
+        signed = int(entry.get("amount") or 0)
+        base = entry.get("base")
+        role_mention = f"<@&{ri['role_id']}>"
+        if ri.get("money_is_percent"):
+            cfg_short = money_income_display(
+                ri.get("money_amount", 0),
+                is_percent=True,
+                is_debit=ri.get("money_is_debit", False),
+                include_suffix=False
+            )
+            base_value = int(base or 0)
+            base_text = format_number(base_value)
+            money_lines.append(
+                f"{role_mention} → {signed_money_amount(signed)} "
+                f"({cfg_short} от {base_text} {MONEY_EMOJI})"
+            )
+        else:
+            cfg_short = money_income_display(
+                ri.get("money_amount", 0),
+                is_percent=False,
+                is_debit=ri.get("money_is_debit", False),
+                include_suffix=False
+            )
+            money_lines.append(f"{role_mention} → {signed_money_amount(signed)} (настройка: {cfg_short})")
+
+    if total_money != 0:
         update_balance(ctx.guild.id, member.id, total_money)
 
     # Собираем эмбед результата
@@ -8745,8 +8983,8 @@ async def collect_cmd(ctx: commands.Context):
 
     e.add_field(name=":moneybag: Денежный доход:", value="\n".join(money_lines) if money_lines else "—", inline=False)
     e.add_field(name=":pick: Доход ресурсов:", value="\n".join(item_lines) if item_lines else "—", inline=False)
-    e.add_field(name=":bar_chart: Итоговый доход:",
-    value=f"\n*{format_number(total_money)} {MONEY_EMOJI}*\n", inline=False)
+    total_text = signed_money_amount(total_money)
+    e.add_field(name=":bar_chart: Итоговый доход:", value=f"\n*{total_text}*\n", inline=False)
 
     server_icon = getattr(ctx.guild.icon, "url", None)
     footer_time = datetime.now().strftime("%d.%m.%Y %H:%M")
