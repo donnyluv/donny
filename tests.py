@@ -18,11 +18,347 @@ from datetime import timedelta
 
 from config import TOKEN
 
+@dataclass(frozen=True)
+class PermissionEntry:
+    """Единичная запись о доступе к флагу."""
+
+    target_type: str  # role | user | admin | everyone
+    target_id: int = 0
+    source: str = "custom"  # custom | default
+
+    def describe(self, guild: disnake.Guild) -> str:
+        if self.target_type == "admin":
+            return "Администраторы сервера"
+        if self.target_type == "everyone":
+            return "Все участники сервера"
+        if self.target_type == "role":
+            role = guild.get_role(self.target_id)
+            return role.mention if role else f"Роль ID {self.target_id}"
+        if self.target_type == "user":
+            member = guild.get_member(self.target_id)
+            return member.mention if member else f"Пользователь ID {self.target_id}"
+        return f"Неизвестный тип ({self.target_type})"
+
+
+@dataclass
+class PermissionSnapshot:
+    """Снимок актуальных прав для конкретного флага на гильдии."""
+
+    flag: "PermissionFlag"
+    allow_everyone: bool
+    entries: list[PermissionEntry]
+    has_custom_overrides: bool
+    everyone_source: str  # none | default | custom
+
+    def is_member_allowed(self, member: disnake.Member) -> bool:
+        if self.allow_everyone:
+            return True
+        if member.guild_permissions.administrator:
+            if any(e.target_type == "admin" for e in self.entries):
+                return True
+        user_roles = {r.id for r in getattr(member, "roles", [])}
+        for entry in self.entries:
+            if entry.target_type == "role" and entry.target_id in user_roles:
+                return True
+            if entry.target_type == "user" and entry.target_id == member.id:
+                return True
+        return False
+
+    def build_lines(self, guild: disnake.Guild) -> list[str]:
+        lines: list[str] = []
+        if self.allow_everyone:
+            suffix = " (по умолчанию)" if self.everyone_source == "default" else ""
+            lines.append(f"• Доступ открыт для всех{suffix}.")
+        for entry in self.entries:
+            suffix = " (по умолчанию)" if entry.source == "default" else ""
+            lines.append(f"• {entry.describe(guild)}{suffix}")
+        if not lines:
+            lines.append("• Нет участников с доступом.")
+        return lines
+
+
+class PermissionFlag:
+    """Описание одного permission-флага и его значений по умолчанию."""
+
+    def __init__(
+        self,
+        manager: "PermissionManager",
+        name: str,
+        *,
+        label: str,
+        description: str,
+        defaults: list[Union[int, str]],
+        category: str,
+        emoji: str | None = None,
+    ):
+        self.manager = manager
+        self.name = name
+        self.label = label
+        self.description = description
+        self.category = category
+        self.emoji = emoji
+        self.default_everyone = False if defaults else True
+        normalized: list[PermissionEntry] = []
+        for item in defaults:
+            entry = self._normalize_default(item)
+            if entry.target_type == "everyone":
+                self.default_everyone = True
+            else:
+                normalized.append(entry)
+        self.default_entries = normalized
+
+    def _normalize_default(self, value: Union[int, str]) -> PermissionEntry:
+        if isinstance(value, int):
+            return PermissionEntry("role", value, source="default")
+        if isinstance(value, str):
+            s = value.strip()
+            if s.lower() in {"administrator", "admin"}:
+                return PermissionEntry("admin", 0, source="default")
+            if s.lower() in {"everyone", "@everyone"}:
+                return PermissionEntry("everyone", 0, source="default")
+            if s.isdigit():
+                return PermissionEntry("role", int(s), source="default")
+        raise ValueError(f"Невозможно интерпретировать значение по умолчанию для {self.name}: {value!r}")
+
+    def snapshot_for_guild(self, guild_id: int) -> PermissionSnapshot:
+        return self.manager.get_snapshot(guild_id, self)
+
+
+class PermissionManager:
+    """Менеджер прав доступа с хранением в SQLite."""
+
+    TABLE_NAME = "command_permissions"
+
+    def __init__(self):
+        self.flags: dict[str, PermissionFlag] = {}
+        self.categories: dict[str, list[PermissionFlag]] = {}
+        self.flag_to_category: dict[str, str] = {}
+
+    def register_flag(
+        self,
+        name: str,
+        *,
+        label: str,
+        description: str,
+        defaults: list[Union[int, str]] | None = None,
+        category: str = "Прочее",
+        emoji: str | None = None,
+    ) -> PermissionFlag:
+        flag = PermissionFlag(
+            self,
+            name,
+            label=label,
+            description=description,
+            defaults=defaults or [],
+            category=category,
+            emoji=emoji,
+        )
+        self.flags[name] = flag
+        self.categories.setdefault(category, []).append(flag)
+        self.flag_to_category[name] = category
+        return flag
+
+    def get_category_for_flag(self, flag: PermissionFlag) -> str | None:
+        return self.flag_to_category.get(flag.name)
+
+    @staticmethod
+    def _normalize_search_text(text: str) -> str:
+        cleaned = re.sub(r"[!@#%^&*()\-_=+`~\[\]{};:'\",.<>/?\\|]", " ", text.lower())
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip()
+
+    def search_flag(self, query: str) -> tuple[str, PermissionFlag] | None:
+        """Возвращает команду, наиболее подходящую под поисковый запрос."""
+        raw_query = (query or "").strip()
+        if not raw_query:
+            return None
+        normalized = raw_query.lower().lstrip("!/\\")
+        normalized = normalized.strip()
+        cleaned = self._normalize_search_text(raw_query)
+        cleaned = cleaned.lstrip("!/\\").strip()
+
+        best_score = 0.0
+        best_flag: PermissionFlag | None = None
+        query_candidates = [c for c in {normalized, cleaned} if c]
+        if cleaned:
+            query_candidates.extend(token for token in cleaned.split() if token)
+
+        for flag in self.flags.values():
+            haystacks_raw = [flag.name, flag.label]
+            if flag.description:
+                haystacks_raw.append(flag.description)
+
+            haystacks: list[str] = []
+            for text in haystacks_raw:
+                lowered = text.lower()
+                haystacks.append(lowered)
+                normalized_text = self._normalize_search_text(text)
+                if normalized_text and normalized_text not in haystacks:
+                    haystacks.append(normalized_text)
+
+            direct_match = False
+            for candidate in query_candidates:
+                if any(candidate in hay for hay in haystacks):
+                    direct_match = True
+                    break
+
+            if direct_match:
+                score = 3.0
+            else:
+                ratios: list[float] = []
+                for candidate in query_candidates:
+                    for hay in haystacks:
+                        if not candidate or not hay:
+                            continue
+                        try:
+                            ratios.append(SequenceMatcher(None, candidate, hay).ratio())
+                        except TypeError:
+                            continue
+                score = max(ratios) if ratios else 0.0
+
+            if score > best_score:
+                best_score = score
+                best_flag = flag
+
+        if best_flag and best_score >= 0.3:
+            category = self.get_category_for_flag(best_flag)
+            if category is None:
+                return None
+            return category, best_flag
+        return None
+
+    def ensure_schema(self):
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.TABLE_NAME} (
+                guild_id INTEGER NOT NULL,
+                flag TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (guild_id, flag, target_type, target_id)
+            )
+            """
+        )
+        conn.commit()
+        conn.close()
+
+    def get_snapshot(self, guild_id: int, flag: PermissionFlag) -> PermissionSnapshot:
+        conn = sqlite3.connect(get_db_path())
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT target_type, target_id FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
+            (guild_id, flag.name),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        if rows:
+            entries: list[PermissionEntry] = []
+            allow_everyone = False
+            for row in rows:
+                target_type = row["target_type"]
+                target_id = int(row["target_id"])
+                if target_type == "marker":
+                    continue
+                if target_type == "everyone":
+                    allow_everyone = True
+                    continue
+                entries.append(PermissionEntry(target_type, target_id, source="custom"))
+            everyone_source = "custom" if allow_everyone else "none"
+            return PermissionSnapshot(flag, allow_everyone, entries, True, everyone_source)
+
+        allow_everyone = flag.default_everyone
+        everyone_source = "default" if allow_everyone else "none"
+        entries = [PermissionEntry(e.target_type, e.target_id, source="default") for e in flag.default_entries]
+        return PermissionSnapshot(flag, allow_everyone, entries, False, everyone_source)
+
+    def is_member_allowed(self, member: disnake.Member, flag: PermissionFlag) -> bool:
+        snapshot = self.get_snapshot(member.guild.id, flag)
+        return snapshot.is_member_allowed(member)
+
+    def list_custom_entries(self, guild_id: int, flag: PermissionFlag) -> list[PermissionEntry]:
+        conn = sqlite3.connect(get_db_path())
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT target_type, target_id FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
+            (guild_id, flag.name),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        result: list[PermissionEntry] = []
+        for row in rows:
+            target_type = row["target_type"]
+            if target_type == "marker":
+                continue
+            result.append(PermissionEntry(target_type, int(row["target_id"]), source="custom"))
+        return result
+
+    def add_entry(self, guild_id: int, flag: PermissionFlag, target_type: str, target_id: int = 0):
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT OR IGNORE INTO {self.TABLE_NAME}(guild_id, flag, target_type, target_id)
+            VALUES(?, ?, ?, ?)
+            """,
+            (guild_id, flag.name, target_type, target_id),
+        )
+        if target_type != "marker":
+            cursor.execute(
+                f"DELETE FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ? AND target_type = 'marker'",
+                (guild_id, flag.name),
+            )
+        conn.commit()
+        conn.close()
+
+    def remove_entry(self, guild_id: int, flag: PermissionFlag, target_type: str, target_id: int = 0):
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute(
+            f"DELETE FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ? AND target_type = ? AND target_id = ?",
+            (guild_id, flag.name, target_type, target_id),
+        )
+        cursor.execute(
+            f"SELECT COUNT(*) FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
+            (guild_id, flag.name),
+        )
+        count = cursor.fetchone()[0]
+        if count == 0:
+            cursor.execute(
+                f"INSERT OR IGNORE INTO {self.TABLE_NAME}(guild_id, flag, target_type, target_id) VALUES(?, ?, 'marker', 0)",
+                (guild_id, flag.name),
+            )
+        conn.commit()
+        conn.close()
+
+    def clear_flag(self, guild_id: int, flag: PermissionFlag):
+        conn = sqlite3.connect(get_db_path())
+        cursor = conn.cursor()
+        cursor.execute(
+            f"DELETE FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
+            (guild_id, flag.name),
+        )
+        conn.commit()
+        conn.close()
+
+    def set_everyone(self, guild_id: int, flag: PermissionFlag, enabled: bool):
+        if enabled:
+            self.add_entry(guild_id, flag, "everyone", 0)
+        else:
+            self.remove_entry(guild_id, flag, "everyone", 0)
+
+
+permission_manager = PermissionManager()
+
 intents = disnake.Intents.all()
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-MONEY_EMOJI = "<:kto_udalit_ban:1400415456392642572>"
+MONEY_EMOJI = ":euro:"
 CURRENCY = "€"
 SHOW_BALANCE_FIELD = True
 
@@ -31,62 +367,351 @@ DEFAULT_SELL_PERCENT = 0.5
 SHOP_ITEMS_PER_PAGE = 5
 SHOP_VIEW_TIMEOUT = 120
 
-# ===== Простые настройки доступа к командам =====
-# Укажите здесь ID ролей (int) или строку "Administrator", которым разрешено использовать команду.
-# Пустой список => команда доступна всем.
-ALLOWED_SHOP = []
-ALLOWED_CREATE_ITEM = ["Administrator", 1365552181020987492]
-ALLOWED_DELETE_ITEM = ["Administrator"]
-ALLOWED_BUY = []
-ALLOWED_SELL = []
-ALLOWED_ITEM_INFO = []
-ALLOWED_INV = []
-ALLOWED_EXPORT = []
-ALLOWED_USE = []
-ALLOWED_GIVE_ITEM = ["Administrator"]
-ALLOWED_TAKE_ITEM = ["Administrator"]
-ALLOWED_BALANCE = []
-ALLOWED_PAY = []
-ALLOWED_WORK = [1326654711918759988, 1326654711918759987, 1326654711905910793]
-ALLOWED_SET_WORK = ["Administrator"]
-
-# Новые права для денежных операций
-ALLOWED_ADD_MONEY = ["Administrator"]
-ALLOWED_REMOVE_MONEY = ["Administrator"]
-ALLOWED_RESET_MONEY = ["Administrator"]
-ALLOWED_ADD_MONEY_ROLE = ["Administrator"]
-ALLOWED_REMOVE_MONEY_ROLE = ["Administrator"]
-ALLOWED_RESET_MONEY_ROLE = ["Administrator"]
-
-# ===== Конфигурация Всемирного банка =====
+# ===== Конфигурация прав доступа =====
 # УКАЖИТЕ ID роли Президента ниже:
 PRESIDENT_ROLE_ID = 123456789012345678  # Замените на реальный ID роли Президента
+
+# Экономика сервера
+ALLOWED_SHOP = permission_manager.register_flag(
+    "ALLOWED_SHOP",
+    label="!shop — магазин",
+    description="Просмотр ассортимента магазина и покупка товаров.",
+    defaults=[],
+    category="Магазин и инвентарь",
+    emoji="🛒",
+)
+ALLOWED_CREATE_ITEM = permission_manager.register_flag(
+    "ALLOWED_CREATE_ITEM",
+    label="!create-item — создание предметов",
+    description="Добавление новых предметов в магазин и инвентари.",
+    defaults=["Administrator", 1365552181020987492],
+    category="Магазин и инвентарь",
+    emoji="🛠️",
+)
+ALLOWED_EDIT_ITEM = permission_manager.register_flag(
+    "ALLOWED_EDIT_ITEM",
+    label="!edit-item — изменение предметов",
+    description="Редактирование существующих предметов магазина.",
+    defaults=["Administrator"],
+    category="Магазин и инвентарь",
+    emoji="🧩",
+)
+ALLOWED_DELETE_ITEM = permission_manager.register_flag(
+    "ALLOWED_DELETE_ITEM",
+    label="!delete-item — удаление предметов",
+    description="Удаление предметов из магазина и базы данных.",
+    defaults=["Administrator"],
+    category="Магазин и инвентарь",
+    emoji="🗑️",
+)
+ALLOWED_BUY = permission_manager.register_flag(
+    "ALLOWED_BUY",
+    label="!buy — покупка",
+    description="Покупка предметов из магазина участниками.",
+    defaults=[],
+    category="Магазин и инвентарь",
+    emoji="💳",
+)
+ALLOWED_SELL = permission_manager.register_flag(
+    "ALLOWED_SELL",
+    label="!sell — продажа",
+    description="Продажа предметов обратно магазину.",
+    defaults=[],
+    category="Магазин и инвентарь",
+    emoji="💰",
+)
+ALLOWED_ITEM_INFO = permission_manager.register_flag(
+    "ALLOWED_ITEM_INFO",
+    label="!item-info — информация",
+    description="Просмотр информации о предметах магазина.",
+    defaults=[],
+    category="Магазин и инвентарь",
+    emoji="ℹ️",
+)
+ALLOWED_INV = permission_manager.register_flag(
+    "ALLOWED_INV",
+    label="!inv — инвентарь",
+    description="Просмотр личного инвентаря участника.",
+    defaults=[],
+    category="Магазин и инвентарь",
+    emoji="🎒",
+)
+ALLOWED_EXPORT = permission_manager.register_flag(
+    "ALLOWED_EXPORT",
+    label="!export — экспорт",
+    description="Экспорт предметов из инвентаря по заявкам.",
+    defaults=[],
+    category="Магазин и инвентарь",
+    emoji="📦",
+)
+ALLOWED_USE = permission_manager.register_flag(
+    "ALLOWED_USE",
+    label="!use — использование",
+    description="Использование предметов из инвентаря.",
+    defaults=[],
+    category="Магазин и инвентарь",
+    emoji="🎯",
+)
+ALLOWED_GIVE_ITEM = permission_manager.register_flag(
+    "ALLOWED_GIVE_ITEM",
+    label="!give-item — выдача",
+    description="Выдача предметов другим участникам.",
+    defaults=["Administrator"],
+    category="Магазин и инвентарь",
+    emoji="🎁",
+)
+ALLOWED_TAKE_ITEM = permission_manager.register_flag(
+    "ALLOWED_TAKE_ITEM",
+    label="!take-item — изъятие",
+    description="Изъятие предметов у участников.",
+    defaults=["Administrator"],
+    category="Магазин и инвентарь",
+    emoji="📥",
+)
+ALLOWED_RESET_INVENTORY = permission_manager.register_flag(
+    "ALLOWED_RESET_INVENTORY",
+    label="!reset-inventory — очистка инвентаря",
+    description="Полная очистка инвентаря участника или роли.",
+    defaults=["Administrator"],
+    category="Магазин и инвентарь",
+    emoji="🧹",
+)
+
+# Денежная система и работа
+ALLOWED_BALANCE = permission_manager.register_flag(
+    "ALLOWED_BALANCE",
+    label="!balance — баланс",
+    description="Просмотр баланса своего или другого участника.",
+    defaults=[],
+    category="Экономика",
+    emoji="💼",
+)
+ALLOWED_PAY = permission_manager.register_flag(
+    "ALLOWED_PAY",
+    label="!pay — перевод",
+    description="Перевод денег между участниками.",
+    defaults=[],
+    category="Экономика",
+    emoji="🔁",
+)
+ALLOWED_WORK = permission_manager.register_flag(
+    "ALLOWED_WORK",
+    label="!work — работа",
+    description="Получение зарплаты через команду работы.",
+    defaults=[1326654711918759988, 1326654711918759987, 1326654711905910793],
+    category="Экономика",
+    emoji="🛠",
+)
+ALLOWED_SET_WORK = permission_manager.register_flag(
+    "ALLOWED_SET_WORK",
+    label="!set-work — настройка работы",
+    description="Настройка параметров работы и зарплат.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="⚙️",
+)
+ALLOWED_ADD_MONEY = permission_manager.register_flag(
+    "ALLOWED_ADD_MONEY",
+    label="!add-money — выдать деньги",
+    description="Выдача средств на баланс участника.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="➕",
+)
+ALLOWED_REMOVE_MONEY = permission_manager.register_flag(
+    "ALLOWED_REMOVE_MONEY",
+    label="!remove-money — забрать деньги",
+    description="Снятие средств с баланса участника.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="➖",
+)
+ALLOWED_RESET_MONEY = permission_manager.register_flag(
+    "ALLOWED_RESET_MONEY",
+    label="!reset-money — обнулить баланс",
+    description="Сброс баланса участника до нуля.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="🧨",
+)
+ALLOWED_ADD_MONEY_ROLE = permission_manager.register_flag(
+    "ALLOWED_ADD_MONEY_ROLE",
+    label="!add-money-role — выдать роли",
+    description="Выдача средств всем участникам роли.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="💸",
+)
+ALLOWED_REMOVE_MONEY_ROLE = permission_manager.register_flag(
+    "ALLOWED_REMOVE_MONEY_ROLE",
+    label="!remove-money-role — снять у роли",
+    description="Списание средств у участников роли.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="📉",
+)
+ALLOWED_RESET_MONEY_ROLE = permission_manager.register_flag(
+    "ALLOWED_RESET_MONEY_ROLE",
+    label="!reset-money-role — обнулить роль",
+    description="Обнуление балансов всех участников роли.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="🧾",
+)
+ALLOWED_ROLE_INCOME = permission_manager.register_flag(
+    "ALLOWED_ROLE_INCOME",
+    label="!role-income — доходные роли",
+    description="Настройка доходных ролей и их параметров.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="🏦",
+)
+ALLOWED_COLLECT = permission_manager.register_flag(
+    "ALLOWED_COLLECT",
+    label="!collect — сбор дохода",
+    description="Получение ежедневного дохода с ролей.",
+    defaults=[],
+    category="Экономика",
+    emoji="📬",
+)
+ALLOWED_INCOME_LIST = permission_manager.register_flag(
+    "ALLOWED_INCOME_LIST",
+    label="!income-list — список доходов",
+    description="Просмотр списка доступных доходных ролей.",
+    defaults=[],
+    category="Экономика",
+    emoji="📊",
+)
+ALLOWED_LOG_MENU = permission_manager.register_flag(
+    "ALLOWED_LOG_MENU",
+    label="!logmenu — настройки логов",
+    description="Открытие панели управления журналами.",
+    defaults=["Administrator"],
+    category="Экономика",
+    emoji="🗂️",
+)
+ALLOWED_ROLE_COMMANDS = permission_manager.register_flag(
+    "ALLOWED_ROLE_COMMANDS",
+    label="Команды ролей",
+    description="Доступ к управлению и синхронизации ролей через бота.",
+    defaults=["Administrator", 1365552181020987492],
+    category="Администрирование",
+    emoji="🔧",
+)
+
+# Всемирный банк и экономика государств
 DEFAULT_COMMISSION_PERCENT = 5  # по умолчанию 5%
-ALLOWED_WORLDBANK = []  # просмотр доступен всем
-ALLOWED_WORLDBANK_MANAGE = ["Administrator", PRESIDENT_ROLE_ID]  # управлять могут админы и Президент
+ALLOWED_WORLDBANK = permission_manager.register_flag(
+    "ALLOWED_WORLDBANK",
+    label="!worldbank — просмотр банка",
+    description="Просмотр состояния Всемирного банка.",
+    defaults=[],
+    category="Банк",
+    emoji="🌐",
+)
+ALLOWED_WORLDBANK_MANAGE = permission_manager.register_flag(
+    "ALLOWED_WORLDBANK_MANAGE",
+    label="!worldbank-manage — управление",
+    description="Настройка комиссий и пополнение Всемирного банка.",
+    defaults=["Administrator", PRESIDENT_ROLE_ID],
+    category="Банк",
+    emoji="💱",
+)
 
-# ===== Доступ для доходных ролей и коллекта =====
-ALLOWED_ROLE_INCOME = ["Administrator"]  # кто может настраивать !role-income
-ALLOWED_COLLECT = []  # кто может использовать !collect (пусто = все)
-ALLOWED_LOG_MENU = ["Administrator"]  # кто может использовать !logmenu (пусто = все)
-ALLOWED_INCOME_LIST = []  # кто может использовать !income-list (пусто = все)
-ALLOWED_ROLE_COMMANDS = ["Administrator", 1365552181020987492]  # имя-метка под ваш permission-роутер
+# Управление странами и лицензиями
+ALLOWED_CREATE_COUNTRY = permission_manager.register_flag(
+    "ALLOWED_CREATE_COUNTRY",
+    label="!create-country — создать страну",
+    description="Создание новой страны в базе данных.",
+    defaults=["Administrator"],
+    category="Государства",
+    emoji="🗺️",
+)
+ALLOWED_EDIT_COUNTRY = permission_manager.register_flag(
+    "ALLOWED_EDIT_COUNTRY",
+    label="!edit-country — редактировать",
+    description="Редактирование параметров существующей страны.",
+    defaults=["Administrator"],
+    category="Государства",
+    emoji="✏️",
+)
+ALLOWED_DELETE_COUNTRY = permission_manager.register_flag(
+    "ALLOWED_DELETE_COUNTRY",
+    label="!delete-country — удалить",
+    description="Удаление страны из списка.",
+    defaults=["Administrator"],
+    category="Государства",
+    emoji="🗑️",
+)
+ALLOWED_COUNTRY_LIST = permission_manager.register_flag(
+    "ALLOWED_COUNTRY_LIST",
+    label="!country-list — список стран",
+    description="Просмотр свободных и занятых стран.",
+    defaults=[],
+    category="Государства",
+    emoji="📜",
+)
+ALLOWED_REG_COUNTRY = permission_manager.register_flag(
+    "ALLOWED_REG_COUNTRY",
+    label="!reg-country — закрепить",
+    description="Закрепление страны за участником.",
+    defaults=["Administrator"],
+    category="Государства",
+    emoji="📝",
+)
+ALLOWED_UNREG_COUNTRY = permission_manager.register_flag(
+    "ALLOWED_UNREG_COUNTRY",
+    label="!unreg-country — освободить",
+    description="Освобождение страны и снятие привязки.",
+    defaults=["Administrator"],
+    category="Государства",
+    emoji="🧾",
+)
+ALLOWED_LIC_INFO = permission_manager.register_flag(
+    "ALLOWED_LIC_INFO",
+    label="!lic-info — лицензии",
+    description="Просмотр информации по военным лицензиям.",
+    defaults=["Administrator"],
+    category="Государства",
+    emoji="🎖️",
+)
+ALLOWED_DELETE_LIC = permission_manager.register_flag(
+    "ALLOWED_DELETE_LIC",
+    label="!delete-lic — удалить лицензию",
+    description="Удаление лицензии из реестра.",
+    defaults=["Administrator"],
+    category="Государства",
+    emoji="⛔",
+)
 
-# ===== Доступ для стран =====
-ALLOWED_CREATE_COUNTRY = ["Administrator"]
-ALLOWED_EDIT_COUNTRY = ["Administrator"]
-ALLOWED_DELETE_COUNTRY = ["Administrator"]
-ALLOWED_COUNTRY_LIST = []  # список доступен всем
-ALLOWED_REG_COUNTRY = ["Administrator"]
-ALLOWED_UNREG_COUNTRY = ["Administrator"]
+# Прочие права административных команд
+ALLOWED_ADD_ROLE = permission_manager.register_flag(
+    "ALLOWED_ADD_ROLE",
+    label="!add-role — выдать роль",
+    description="Выдача ролей через интерфейс бота.",
+    defaults=["Administrator"],
+    category="Администрирование",
+    emoji="➕",
+)
+ALLOWED_TAKE_ROLE = permission_manager.register_flag(
+    "ALLOWED_TAKE_ROLE",
+    label="!take-role — забрать роль",
+    description="Удаление ролей у участников через бота.",
+    defaults=["Administrator"],
+    category="Администрирование",
+    emoji="➖",
+)
+ALLOWED_APANEL = permission_manager.register_flag(
+    "ALLOWED_APANEL",
+    label="!apanel — панель администратора",
+    description="Доступ к расширенной панели администратора.",
+    defaults=["Administrator"],
+    category="Администрирование",
+    emoji="🛡️",
+)
 
 # Стоимость строительства военного завода (для создания лицензии)
 LICENSE_FACTORY_COST = 1000  # можете изменить стоимость по своему усмотрению
-
-# Доступ к команде !lic-info (по умолчанию только администраторы)
-ALLOWED_LIC_INFO = ["Administrator"]
-# Доступ к удалению лицензии
-ALLOWED_DELETE_LIC = ["Administrator"]
 
 # Стоимость передачи лицензии по типам вооружения
 # Измените значения в этом словаре, чтобы настроить рост цены
@@ -139,41 +764,65 @@ ALL_CONTINENTS = [
     "Океания",
 ]
 
-def is_user_allowed_for(allowed: list[Union[int, str]], member: disnake.Member) -> bool:
-    """
-    Возвращает True, если член сервера имеет доступ на основе списка allowed.
-    allowed: список из чисел (ID ролей) и/или строки "Administrator".
-    Пустой список => доступ всем.
-    """
+def is_user_allowed_for(
+    allowed: Union[list[Union[int, str]], PermissionFlag],
+    member: disnake.Member,
+) -> bool:
+    """Проверяет, есть ли у пользователя доступ по списку или permission-флагу."""
+    if isinstance(allowed, PermissionFlag):
+        guild = getattr(member, "guild", None)
+        if guild is None:
+            return allowed.default_everyone
+        return permission_manager.is_member_allowed(member, allowed)
     if not allowed:
         return True
-    # Разрешить администраторам, если явно указано "Administrator"
     if any(isinstance(x, str) and x.strip().lower() == "administrator" for x in allowed):
         if member.guild_permissions.administrator:
             return True
-    user_role_ids = {r.id for r in member.roles}
+    user_role_ids = {r.id for r in getattr(member, "roles", [])}
     for x in allowed:
-        if isinstance(x, int):
-            if x in user_role_ids:
-                return True
-        elif isinstance(x, str):
+        if isinstance(x, int) and x in user_role_ids:
+            return True
+        if isinstance(x, str):
             s = x.strip()
             if s.isdigit() and int(s) in user_role_ids:
                 return True
     return False
 
 
-async def ensure_allowed_ctx(ctx: commands.Context, allowed: list[Union[int, str]]) -> bool:
-    """Проверяет доступ для автора команды. Возвращает True если доступ разрешён, иначе отправляет сообщение и возвращает False."""
-    if not ctx.guild:
-        # В ЛС роли недоступны; если список пуст — разрешаем; иначе запрещаем.
+async def ensure_allowed_ctx(
+    ctx: commands.Context,
+    allowed: Union[list[Union[int, str]], PermissionFlag],
+    *,
+    silent: bool = False,
+) -> bool:
+    """Проверяет доступ для автора команды. При отсутствии прав может выводить сообщение об ошибке."""
+    guild = ctx.guild
+
+    if isinstance(allowed, PermissionFlag):
+        if guild is None:
+            if allowed.default_everyone:
+                return True
+            if not silent:
+                await ctx.send(embed=error_embed("Доступ запрещён", "Эта команда доступна только на сервере."))
+            return False
+        if permission_manager.is_member_allowed(ctx.author, allowed):
+            return True
+        if not silent:
+            await ctx.send(embed=error_embed("Доступ запрещён", "У вас нет прав на использование этой команды."))
+        return False
+
+    if guild is None:
         if not allowed:
             return True
-        await ctx.send(embed=error_embed("Доступ запрещён", "Эта команда должна использоваться на сервере."))
+        if not silent:
+            await ctx.send(embed=error_embed("Доступ запрещён", "Эта команда должна использоваться на сервере."))
         return False
+    
     if is_user_allowed_for(allowed, ctx.author):
         return True
-    await ctx.send(embed=error_embed("Доступ запрещён", "У вас нет прав на использование этой команды."))
+    if not silent:
+        await ctx.send(embed=error_embed("Доступ запрещён", "У вас нет прав на использование этой команды."))
     return False
 # ===============================================
 
@@ -210,6 +859,7 @@ USAGE_HINTS: dict[str, str] = {
     "income-list": "!income-list",
     # Логи
     "logmenu": "!logmenu",
+    "perms": "!perms",
 }
 
 def usage_embed(cmd_name: str) -> disnake.Embed:
@@ -274,7 +924,18 @@ def setup_database():
         ON balances (guild_id, balance DESC)
     """)
 
-    # УДАЛЕНО: таблица permissions и всё связанное с ней
+    # Таблица кастомных прав доступа
+    cursor.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {PermissionManager.TABLE_NAME} (
+            guild_id INTEGER NOT NULL,
+            flag TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (guild_id, flag, target_type, target_id)
+        )
+        """
+    )
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS work_settings (
@@ -1529,7 +2190,7 @@ class CountryLicensePickView(disnake.ui.View):
     async def on_timeout(self):
         try:
             for c in self.children:
-                if isinstance(c, (disnake.ui.Button, disnake.ui.SelectBase)):
+                if hasattr(c, "disabled"):
                     c.disabled = True
             if self.message:
                 await self.message.edit(view=self)
@@ -2412,25 +3073,25 @@ class CountryProfileSelect(disnake.ui.StringSelect):
     def __init__(self, target: disnake.Member, author_id: int):
         options = [
             disnake.SelectOption(
-                label=":placard: Профиль страны",
+                label="🪧 Профиль страны",
                 value="about",
-                description="__Основная информация__",
+                description="Основная информация",
                 default=True,
             ),
             disnake.SelectOption(
-                label=":paperclips: Государственное устройство",
+                label="🖇️ Государственное устройство",
                 value="gov",
-                description="__Управление государством__",
+                description="Управление государством",
             ),
             disnake.SelectOption(
-                label=":ticket: Лицензии",
+                label="🎫 Лицензии",
                 value="licenses",
-                description="__Информация о лицензиях__",
+                description="Информация о лицензиях",
             ),
             disnake.SelectOption(
-                label=":rocket: Создание техники",
+                label="🚀 Создание техники",
                 value="tech_create",
-                description="__Заявка на технику__",
+                description="Заявка на технику",
             ),
         ]
         super().__init__(
@@ -5516,6 +6177,466 @@ ADMIN_COMMANDS_WITH_FLAGS: list[tuple[str, str, str]] = [
     ("!reset-inventory", "очистить инвентарь", "ALLOWED_RESET_INVENTORY"),
     ("!apanel", "панель администрации (изменено)", "ALLOWED_APANEL"),
 ]
+
+
+class PermissionCategorySelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view: "PermissionsMenuView"):
+        self.parent_view = parent_view
+        options = []
+        for category in parent_view.manager.categories.keys():
+            options.append(
+                disnake.SelectOption(
+                    label=category,
+                    value=category,
+                    default=category == parent_view.category,
+                )
+            )
+        super().__init__(
+            placeholder="Категория команд",
+            options=options[:25],
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        if not await self.parent_view.check_interaction(inter):
+            return
+        new_category = self.values[0]
+        self.parent_view.set_category(new_category)
+        await self.parent_view.refresh(inter)
+
+
+class PermissionFlagSelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view: "PermissionsMenuView"):
+        self.parent_view = parent_view
+        options = self.parent_view.build_flag_options()
+        super().__init__(
+            placeholder="Команда",
+            options=options,
+            min_values=1,
+            max_values=1,
+            row=1,
+        )
+
+    def refresh_options(self):
+        self.options = self.parent_view.build_flag_options()
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        if not await self.parent_view.check_interaction(inter):
+            return
+        self.parent_view.set_flag(self.values[0])
+        await self.parent_view.refresh(inter)
+
+
+class PermissionRolePicker(disnake.ui.RoleSelect):
+    def __init__(self, parent_view: "PermissionsMenuView"):
+        self.parent_view = parent_view
+        super().__init__(
+            placeholder="Выберите роли",
+            min_values=1,
+            max_values=10,
+        )
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        if not await self.parent_view.check_interaction(inter):
+            return
+        added: list[str] = []
+        for role in self.values:
+            self.parent_view.manager.add_entry(inter.guild.id, self.parent_view.flag, "role", role.id)
+            added.append(role.mention)
+        await self.parent_view.apply_changes(inter, f"Добавлены роли: {', '.join(added)}")
+
+
+class PermissionMemberPicker(disnake.ui.UserSelect):
+    def __init__(self, parent_view: "PermissionsMenuView"):
+        self.parent_view = parent_view
+        super().__init__(
+            placeholder="Выберите участников",
+            min_values=1,
+            max_values=10,
+        )
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        if not await self.parent_view.check_interaction(inter):
+            return
+        added: list[str] = []
+        for member in self.values:
+            self.parent_view.manager.add_entry(inter.guild.id, self.parent_view.flag, "user", member.id)
+            added.append(member.mention)
+        await self.parent_view.apply_changes(inter, f"Добавлены участники: {', '.join(added)}")
+
+
+class PermissionRemoveSelect(disnake.ui.StringSelect):
+    def __init__(self, parent_view: "PermissionsMenuView", options: list[disnake.SelectOption]):
+        self.parent_view = parent_view
+        capped_options = options[:25]
+        super().__init__(
+            placeholder="Выберите записи для удаления",
+            options=capped_options,
+            min_values=1,
+            max_values=len(capped_options),
+        )
+
+    async def callback(self, inter: disnake.MessageInteraction):
+        if not await self.parent_view.check_interaction(inter):
+            return
+        removed_labels: list[str] = []
+        for value in self.values:
+            t_type, t_id = value.split(":", 1)
+            target_id = int(t_id)
+            self.parent_view.manager.remove_entry(inter.guild.id, self.parent_view.flag, t_type, target_id)
+            if t_type == "role":
+                role = inter.guild.get_role(target_id)
+                removed_labels.append(role.mention if role else f"Роль ID {target_id}")
+            elif t_type == "user":
+                removed_labels.append(f"<@{target_id}>")
+            elif t_type == "admin":
+                removed_labels.append("Администраторы")
+            elif t_type == "everyone":
+                removed_labels.append("Все участники")
+        await self.parent_view.apply_changes(inter, f"Удалено: {', '.join(removed_labels)}")
+
+
+class PermissionRoleSelectView(disnake.ui.View):
+    def __init__(self, parent_view: "PermissionsMenuView"):
+        super().__init__(timeout=120)
+        self.parent_view = parent_view
+        self.add_item(PermissionRolePicker(parent_view))
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        return await self.parent_view.check_interaction(inter)
+
+
+class PermissionMemberSelectView(disnake.ui.View):
+    def __init__(self, parent_view: "PermissionsMenuView"):
+        super().__init__(timeout=120)
+        self.parent_view = parent_view
+        self.add_item(PermissionMemberPicker(parent_view))
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        return await self.parent_view.check_interaction(inter)
+
+
+class PermissionRemoveView(disnake.ui.View):
+    def __init__(self, parent_view: "PermissionsMenuView", options: list[disnake.SelectOption]):
+        super().__init__(timeout=120)
+        self.parent_view = parent_view
+        self.add_item(PermissionRemoveSelect(parent_view, options))
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        return await self.parent_view.check_interaction(inter)
+
+
+class PermissionSearchModal(disnake.ui.Modal):
+    def __init__(self, parent_view: "PermissionsMenuView"):
+        self.parent_view = parent_view
+        components = [
+            disnake.ui.TextInput(
+                label="Что ищем?",
+                custom_id="query",
+                placeholder="Введите название, команду или часть описания",
+                min_length=2,
+                max_length=60,
+            )
+        ]
+        super().__init__(title="Поиск команды", components=components)
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        if not await self.parent_view.check_interaction(inter):
+            return
+        query = inter.text_values.get("query", "").strip()
+        result = self.parent_view.manager.search_flag(query)
+        if result is None:
+            await inter.response.send_message("Команда не найдена. Попробуйте другой запрос.", ephemeral=True)
+            return
+        category, flag = result
+        self.parent_view.focus_flag(flag)
+        await self.parent_view.refresh()
+        await inter.response.send_message(
+            f"Переключено на **{flag.label}** (категория {category}).",
+        )
+
+
+class PermissionsMenuView(disnake.ui.View):
+    def __init__(self, ctx: commands.Context):
+        super().__init__(timeout=420)
+        self.ctx = ctx
+        self.guild = ctx.guild
+        self.message: disnake.Message | None = None
+        self.manager = permission_manager
+        categories = list(self.manager.categories.keys())
+        self.category = categories[0] if categories else ""
+        flags = self.manager.categories.get(self.category, [])
+        self.flag = flags[0] if flags else next(iter(self.manager.flags.values()))
+
+        self.category_select = PermissionCategorySelect(self)
+        self.flag_select = PermissionFlagSelect(self)
+        self.add_item(self.category_select)
+        self.add_item(self.flag_select)
+        self.refresh_controls()
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        return await self.check_interaction(inter)
+
+    async def check_interaction(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id == self.ctx.author.id:
+            return True
+        perms = getattr(inter.user, "guild_permissions", None)
+        if perms and (perms.administrator or perms.manage_guild):
+            return True
+        await inter.response.send_message("⛔ Это меню доступно только администраторам сервера.", ephemeral=True)
+        return False
+
+    def build_flag_options(self) -> list[disnake.SelectOption]:
+        options: list[disnake.SelectOption] = []
+        for flag in self.manager.categories.get(self.category, []):
+            description = flag.description[:95] if flag.description else None
+            options.append(
+                disnake.SelectOption(
+                    label=flag.label[:100],
+                    value=flag.name,
+                    description=description,
+                    emoji=flag.emoji,
+                    default=flag is self.flag,
+                )
+            )
+        return options[:25]
+
+    def set_category(self, category: str):
+        if category not in self.manager.categories:
+            return
+        self.category = category
+        flags = self.manager.categories.get(category, [])
+        if flags:
+            self.flag = flags[0]
+        self.update_category_defaults()
+        self.flag_select.refresh_options()
+        self.refresh_controls()
+
+    def set_flag(self, flag_name: str):
+        flag = self.manager.flags.get(flag_name)
+        if flag is None:
+            return
+        self.flag = flag
+        self.refresh_controls()
+
+    def focus_flag(self, flag: PermissionFlag):
+        category = self.manager.get_category_for_flag(flag)
+        if category:
+            self.category = category
+        self.update_category_defaults()
+        self.flag = flag
+        self.refresh_controls()
+
+    def update_category_defaults(self):
+        for option in self.category_select.options:
+            option.default = option.value == self.category
+
+    def refresh_controls(self):
+        snapshot = self.manager.get_snapshot(self.guild.id, self.flag)
+        toggle_button = self.toggle_everyone  # type: ignore[attr-defined]
+        toggle_button.label = "Открыть для всех" if not snapshot.allow_everyone else "Запретить @everyone"
+        toggle_button.style = (
+            disnake.ButtonStyle.success if not snapshot.allow_everyone else disnake.ButtonStyle.danger
+        )
+        remove_button = self.remove_access  # type: ignore[attr-defined]
+        remove_button.disabled = not snapshot.has_custom_overrides
+        reset_button = self.reset_to_defaults  # type: ignore[attr-defined]
+        reset_button.disabled = not snapshot.has_custom_overrides
+        self.update_category_defaults()
+        self.flag_select.refresh_options()
+
+    def build_embed(self) -> disnake.Embed:
+        snapshot = self.manager.get_snapshot(self.guild.id, self.flag)
+        if snapshot.allow_everyone:
+            color = disnake.Color.green()
+        elif snapshot.has_custom_overrides:
+            color = disnake.Color.gold()
+        else:
+            color = disnake.Color.red()
+        title_prefix = f"{self.flag.emoji} " if self.flag.emoji else ""
+        embed = disnake.Embed(
+            title=f"{title_prefix}Настройка прав — {self.flag.label}",
+            description=self.flag.description or "",
+            color=color,
+        )
+        lines = snapshot.build_lines(self.guild)
+        embed.add_field(name="Текущий доступ", value="\n".join(lines), inline=False)
+        mode = "Пользовательские правила" if snapshot.has_custom_overrides else "Настройки по умолчанию"
+        embed.add_field(name="Режим", value=mode, inline=False)
+        embed.set_footer(text=f"Категория: {self.category} • Настройки действуют только на этом сервере")
+        return embed
+
+    def build_overview_embed(self) -> disnake.Embed:
+        embed = disnake.Embed(
+            title="Обзор прав бота",
+            description="🟢 — открыт для всех\n🟡 — есть свои правила\n🔴 — используются значения по умолчанию",
+            color=disnake.Color.dark_teal(),
+        )
+        embed.set_footer(text=f"Сервер: {self.guild.name}")
+
+        for category, flags in self.manager.categories.items():
+            if not flags:
+                continue
+            lines: list[str] = []
+            for flag in flags:
+                snapshot = self.manager.get_snapshot(self.guild.id, flag)
+                if snapshot.allow_everyone:
+                    status = "🟢"
+                elif snapshot.has_custom_overrides:
+                    status = "🟡"
+                else:
+                    status = "🔴"
+                lines.append(f"{status} {flag.label}")
+            if not lines:
+                continue
+            current_block = ""
+            block_index = 0
+            for line in lines:
+                candidate = f"{current_block}{line}\n"
+                if len(candidate) > 1018:
+                    title = category if block_index == 0 else f"{category} (продолжение {block_index})"
+                    embed.add_field(name=title, value=current_block.strip(), inline=False)
+                    current_block = f"{line}\n"
+                    block_index += 1
+                else:
+                    current_block = candidate
+            if current_block:
+                title = category if block_index == 0 else f"{category} (продолжение {block_index})"
+                embed.add_field(name=title, value=current_block.strip(), inline=False)
+
+        if not embed.fields:
+            embed.description += "\nНет зарегистрированных команд."
+        return embed
+
+    async def refresh(self, inter: disnake.MessageInteraction | None = None):
+        self.refresh_controls()
+        if self.message:
+            await self.message.edit(embed=self.build_embed(), view=self)
+        if inter and not inter.response.is_done():
+            await inter.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def apply_changes(self, inter: disnake.MessageInteraction, summary: str):
+        self.refresh_controls()
+        if self.message:
+            await self.message.edit(embed=self.build_embed(), view=self)
+        await inter.response.edit_message(content=summary, view=None)
+
+    async def on_timeout(self):
+        for item in self.children:
+            if hasattr(item, "disabled"):
+                item.disabled = True
+        if self.message:
+            with contextlib.suppress(Exception):
+                await self.message.edit(view=self)
+
+    @disnake.ui.button(label="Добавить роль", style=disnake.ButtonStyle.success, row=2)
+    async def add_role_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        view = PermissionRoleSelectView(self)
+        await inter.response.send_message("Выберите роли, которым дать доступ", view=view, ephemeral=True)
+
+    @disnake.ui.button(label="Добавить участника", style=disnake.ButtonStyle.success, row=2)
+    async def add_user_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        view = PermissionMemberSelectView(self)
+        await inter.response.send_message("Выберите участников, которым дать доступ", view=view, ephemeral=True)
+
+    @disnake.ui.button(label="Поиск команды", emoji="🔍", style=disnake.ButtonStyle.secondary, row=2)
+    async def search_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        await inter.response.send_modal(PermissionSearchModal(self))
+
+    @disnake.ui.button(label="Добавить админов", style=disnake.ButtonStyle.primary, row=2)
+    async def add_admins_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        self.manager.add_entry(inter.guild.id, self.flag, "admin", 0)
+        await inter.response.send_message("Администраторы получили доступ.", ephemeral=True)
+        await self.refresh()
+
+    @disnake.ui.button(label="Открыть для всех", style=disnake.ButtonStyle.success, row=3)
+    async def toggle_everyone(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        snapshot = self.manager.get_snapshot(inter.guild.id, self.flag)
+        new_value = not snapshot.allow_everyone
+        self.manager.set_everyone(inter.guild.id, self.flag, new_value)
+        await inter.response.send_message(
+            "Доступ открыт для всех." if new_value else "Доступ для всех отключён.",
+            ephemeral=True,
+        )
+        await self.refresh()
+
+    @disnake.ui.button(label="Удалить доступ", style=disnake.ButtonStyle.danger, row=3)
+    async def remove_access(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        entries = self.manager.list_custom_entries(inter.guild.id, self.flag)
+        options: list[disnake.SelectOption] = []
+        for entry in entries:
+            if entry.target_type == "everyone":
+                label = "Все участники"
+            elif entry.target_type == "admin":
+                label = "Администраторы"
+            elif entry.target_type == "role":
+                role = inter.guild.get_role(entry.target_id)
+                label = role.name if role else f"Роль ID {entry.target_id}"
+            else:
+                member = inter.guild.get_member(entry.target_id)
+                label = member.display_name if member else f"Пользователь ID {entry.target_id}"
+            options.append(disnake.SelectOption(label=label[:100], value=f"{entry.target_type}:{entry.target_id}"))
+        if not options:
+            await inter.response.send_message("Нет пользовательских записей для удаления.", ephemeral=True)
+            return
+        view = PermissionRemoveView(self, options)
+        await inter.response.send_message("Выберите, что удалить", view=view, ephemeral=True)
+
+    @disnake.ui.button(label="Сбросить", style=disnake.ButtonStyle.secondary, row=3)
+    async def reset_to_defaults(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        self.manager.clear_flag(inter.guild.id, self.flag)
+        await inter.response.send_message("Настройки возвращены к стандартным.", ephemeral=True)
+        await self.refresh()
+
+    @disnake.ui.button(label="Обзор настроек", emoji="📊", style=disnake.ButtonStyle.secondary, row=4)
+    async def overview_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        embed = self.build_overview_embed()
+        await inter.response.send_message(embed=embed, ephemeral=True)
+
+    @disnake.ui.button(label="Закрыть", style=disnake.ButtonStyle.danger, row=4)
+    async def close_menu(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
+        if not await self.check_interaction(inter):
+            return
+        for item in self.children:
+            if isinstance(item, (disnake.ui.Button, disnake.ui.SelectBase)):
+                item.disabled = True
+        if self.message:
+            await self.message.edit(view=self)
+        await inter.response.send_message("Меню закрыто.", ephemeral=True)
+
+
+@bot.command(name="perms")
+async def perms_command(ctx: commands.Context):
+    """Открывает меню управления правами бота."""
+    if not ctx.guild:
+        await ctx.send(embed=error_embed("Недоступно", "Команда работает только на сервере."))
+        return
+    author_perms = ctx.author.guild_permissions
+    if not (author_perms.administrator or author_perms.manage_guild):
+        await ctx.send(embed=error_embed("Недостаточно прав", "Нужны права администратора или управления сервером."))
+        return
+
+    view = PermissionsMenuView(ctx)
+    message = await ctx.send(embed=view.build_embed(), view=view)
+    view.message = message
 
 
 async def _ensure_allowed_silent(ctx: commands.Context, allowed_flag) -> bool:
