@@ -1,5 +1,5 @@
 import disnake
-from disnake.ext import commands, tasks
+from disnake.ext import commands
 import sqlite3
 import os
 import random
@@ -12,347 +12,11 @@ import math
 from difflib import SequenceMatcher
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Union, Optional, Callable, Awaitable
+from typing import Union, Optional
 from typing import Optional, List
 from datetime import timedelta
 
 from config import TOKEN
-
-@dataclass(frozen=True)
-class PermissionEntry:
-    """Единичная запись о доступе к флагу."""
-
-    target_type: str  # role | user | admin | everyone
-    target_id: int = 0
-    source: str = "custom"  # custom | default
-
-    def describe(self, guild: disnake.Guild) -> str:
-        if self.target_type == "admin":
-            return "Администраторы сервера"
-        if self.target_type == "everyone":
-            return "Все участники сервера"
-        if self.target_type == "role":
-            role = guild.get_role(self.target_id)
-            return role.mention if role else f"Роль ID {self.target_id}"
-        if self.target_type == "user":
-            member = guild.get_member(self.target_id)
-            return member.mention if member else f"Пользователь ID {self.target_id}"
-        return f"Неизвестный тип ({self.target_type})"
-
-
-@dataclass
-class PermissionSnapshot:
-    """Снимок актуальных прав для конкретного флага на гильдии."""
-
-    flag: "PermissionFlag"
-    allow_everyone: bool
-    entries: list[PermissionEntry]
-    has_custom_overrides: bool
-    everyone_source: str  # none | default | custom
-
-    def is_member_allowed(self, member: disnake.Member) -> bool:
-        if self.allow_everyone:
-            return True
-        if member.guild_permissions.administrator:
-            if any(e.target_type == "admin" for e in self.entries):
-                return True
-        user_roles = {r.id for r in getattr(member, "roles", [])}
-        for entry in self.entries:
-            if entry.target_type == "role" and entry.target_id in user_roles:
-                return True
-            if entry.target_type == "user" and entry.target_id == member.id:
-                return True
-        return False
-
-    def build_lines(self, guild: disnake.Guild) -> list[str]:
-        lines: list[str] = []
-        if self.allow_everyone:
-            suffix = " (по умолчанию)" if self.everyone_source == "default" else ""
-            lines.append(f"• Доступ открыт для всех{suffix}.")
-        for entry in self.entries:
-            suffix = " (по умолчанию)" if entry.source == "default" else ""
-            lines.append(f"• {entry.describe(guild)}{suffix}")
-        if not lines:
-            lines.append("• Нет участников с доступом.")
-        return lines
-
-
-class PermissionFlag:
-    """Описание одного permission-флага и его значений по умолчанию."""
-
-    def __init__(
-        self,
-        manager: "PermissionManager",
-        name: str,
-        *,
-        label: str,
-        description: str,
-        defaults: list[Union[int, str]],
-        category: str,
-        emoji: str | None = None,
-    ):
-        self.manager = manager
-        self.name = name
-        self.label = label
-        self.description = description
-        self.category = category
-        self.emoji = emoji
-        self.default_everyone = False if defaults else True
-        normalized: list[PermissionEntry] = []
-        for item in defaults:
-            entry = self._normalize_default(item)
-            if entry.target_type == "everyone":
-                self.default_everyone = True
-            else:
-                normalized.append(entry)
-        self.default_entries = normalized
-
-    def _normalize_default(self, value: Union[int, str]) -> PermissionEntry:
-        if isinstance(value, int):
-            return PermissionEntry("role", value, source="default")
-        if isinstance(value, str):
-            s = value.strip()
-            if s.lower() in {"administrator", "admin"}:
-                return PermissionEntry("admin", 0, source="default")
-            if s.lower() in {"everyone", "@everyone"}:
-                return PermissionEntry("everyone", 0, source="default")
-            if s.isdigit():
-                return PermissionEntry("role", int(s), source="default")
-        raise ValueError(f"Невозможно интерпретировать значение по умолчанию для {self.name}: {value!r}")
-
-    def snapshot_for_guild(self, guild_id: int) -> PermissionSnapshot:
-        return self.manager.get_snapshot(guild_id, self)
-
-
-class PermissionManager:
-    """Менеджер прав доступа с хранением в SQLite."""
-
-    TABLE_NAME = "command_permissions"
-
-    def __init__(self):
-        self.flags: dict[str, PermissionFlag] = {}
-        self.categories: dict[str, list[PermissionFlag]] = {}
-        self.flag_to_category: dict[str, str] = {}
-
-    def register_flag(
-        self,
-        name: str,
-        *,
-        label: str,
-        description: str,
-        defaults: list[Union[int, str]] | None = None,
-        category: str = "Прочее",
-        emoji: str | None = None,
-    ) -> PermissionFlag:
-        flag = PermissionFlag(
-            self,
-            name,
-            label=label,
-            description=description,
-            defaults=defaults or [],
-            category=category,
-            emoji=emoji,
-        )
-        self.flags[name] = flag
-        self.categories.setdefault(category, []).append(flag)
-        self.flag_to_category[name] = category
-        return flag
-
-    def get_category_for_flag(self, flag: PermissionFlag) -> str | None:
-        return self.flag_to_category.get(flag.name)
-
-    @staticmethod
-    def _normalize_search_text(text: str) -> str:
-        cleaned = re.sub(r"[!@#%^&*()\-_=+`~\[\]{};:'\",.<>/?\\|]", " ", text.lower())
-        cleaned = re.sub(r"\s+", " ", cleaned)
-        return cleaned.strip()
-
-    def search_flag(self, query: str) -> tuple[str, PermissionFlag] | None:
-        """Возвращает команду, наиболее подходящую под поисковый запрос."""
-        raw_query = (query or "").strip()
-        if not raw_query:
-            return None
-        normalized = raw_query.lower().lstrip("!/\\")
-        normalized = normalized.strip()
-        cleaned = self._normalize_search_text(raw_query)
-        cleaned = cleaned.lstrip("!/\\").strip()
-
-        best_score = 0.0
-        best_flag: PermissionFlag | None = None
-        query_candidates = [c for c in {normalized, cleaned} if c]
-        if cleaned:
-            query_candidates.extend(token for token in cleaned.split() if token)
-
-        for flag in self.flags.values():
-            haystacks_raw = [flag.name, flag.label]
-            if flag.description:
-                haystacks_raw.append(flag.description)
-
-            haystacks: list[str] = []
-            for text in haystacks_raw:
-                lowered = text.lower()
-                haystacks.append(lowered)
-                normalized_text = self._normalize_search_text(text)
-                if normalized_text and normalized_text not in haystacks:
-                    haystacks.append(normalized_text)
-
-            direct_match = False
-            for candidate in query_candidates:
-                if any(candidate in hay for hay in haystacks):
-                    direct_match = True
-                    break
-
-            if direct_match:
-                score = 3.0
-            else:
-                ratios: list[float] = []
-                for candidate in query_candidates:
-                    for hay in haystacks:
-                        if not candidate or not hay:
-                            continue
-                        try:
-                            ratios.append(SequenceMatcher(None, candidate, hay).ratio())
-                        except TypeError:
-                            continue
-                score = max(ratios) if ratios else 0.0
-
-            if score > best_score:
-                best_score = score
-                best_flag = flag
-
-        if best_flag and best_score >= 0.3:
-            category = self.get_category_for_flag(best_flag)
-            if category is None:
-                return None
-            return category, best_flag
-        return None
-
-    def ensure_schema(self):
-        conn = sqlite3.connect(get_db_path())
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self.TABLE_NAME} (
-                guild_id INTEGER NOT NULL,
-                flag TEXT NOT NULL,
-                target_type TEXT NOT NULL,
-                target_id INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (guild_id, flag, target_type, target_id)
-            )
-            """
-        )
-        conn.commit()
-        conn.close()
-
-    def get_snapshot(self, guild_id: int, flag: PermissionFlag) -> PermissionSnapshot:
-        conn = sqlite3.connect(get_db_path())
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            f"SELECT target_type, target_id FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
-            (guild_id, flag.name),
-        )
-        rows = cursor.fetchall()
-        conn.close()
-
-        if rows:
-            entries: list[PermissionEntry] = []
-            allow_everyone = False
-            for row in rows:
-                target_type = row["target_type"]
-                target_id = int(row["target_id"])
-                if target_type == "marker":
-                    continue
-                if target_type == "everyone":
-                    allow_everyone = True
-                    continue
-                entries.append(PermissionEntry(target_type, target_id, source="custom"))
-            everyone_source = "custom" if allow_everyone else "none"
-            return PermissionSnapshot(flag, allow_everyone, entries, True, everyone_source)
-
-        allow_everyone = flag.default_everyone
-        everyone_source = "default" if allow_everyone else "none"
-        entries = [PermissionEntry(e.target_type, e.target_id, source="default") for e in flag.default_entries]
-        return PermissionSnapshot(flag, allow_everyone, entries, False, everyone_source)
-
-    def is_member_allowed(self, member: disnake.Member, flag: PermissionFlag) -> bool:
-        snapshot = self.get_snapshot(member.guild.id, flag)
-        return snapshot.is_member_allowed(member)
-
-    def list_custom_entries(self, guild_id: int, flag: PermissionFlag) -> list[PermissionEntry]:
-        conn = sqlite3.connect(get_db_path())
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(
-            f"SELECT target_type, target_id FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
-            (guild_id, flag.name),
-        )
-        rows = cursor.fetchall()
-        conn.close()
-        result: list[PermissionEntry] = []
-        for row in rows:
-            target_type = row["target_type"]
-            if target_type == "marker":
-                continue
-            result.append(PermissionEntry(target_type, int(row["target_id"]), source="custom"))
-        return result
-
-    def add_entry(self, guild_id: int, flag: PermissionFlag, target_type: str, target_id: int = 0):
-        conn = sqlite3.connect(get_db_path())
-        cursor = conn.cursor()
-        cursor.execute(
-            f"""
-            INSERT OR IGNORE INTO {self.TABLE_NAME}(guild_id, flag, target_type, target_id)
-            VALUES(?, ?, ?, ?)
-            """,
-            (guild_id, flag.name, target_type, target_id),
-        )
-        if target_type != "marker":
-            cursor.execute(
-                f"DELETE FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ? AND target_type = 'marker'",
-                (guild_id, flag.name),
-            )
-        conn.commit()
-        conn.close()
-
-    def remove_entry(self, guild_id: int, flag: PermissionFlag, target_type: str, target_id: int = 0):
-        conn = sqlite3.connect(get_db_path())
-        cursor = conn.cursor()
-        cursor.execute(
-            f"DELETE FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ? AND target_type = ? AND target_id = ?",
-            (guild_id, flag.name, target_type, target_id),
-        )
-        cursor.execute(
-            f"SELECT COUNT(*) FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
-            (guild_id, flag.name),
-        )
-        count = cursor.fetchone()[0]
-        if count == 0:
-            cursor.execute(
-                f"INSERT OR IGNORE INTO {self.TABLE_NAME}(guild_id, flag, target_type, target_id) VALUES(?, ?, 'marker', 0)",
-                (guild_id, flag.name),
-            )
-        conn.commit()
-        conn.close()
-
-    def clear_flag(self, guild_id: int, flag: PermissionFlag):
-        conn = sqlite3.connect(get_db_path())
-        cursor = conn.cursor()
-        cursor.execute(
-            f"DELETE FROM {self.TABLE_NAME} WHERE guild_id = ? AND flag = ?",
-            (guild_id, flag.name),
-        )
-        conn.commit()
-        conn.close()
-
-    def set_everyone(self, guild_id: int, flag: PermissionFlag, enabled: bool):
-        if enabled:
-            self.add_entry(guild_id, flag, "everyone", 0)
-        else:
-            self.remove_entry(guild_id, flag, "everyone", 0)
-
-
-permission_manager = PermissionManager()
 
 intents = disnake.Intents.all()
 
@@ -367,462 +31,90 @@ DEFAULT_SELL_PERCENT = 0.5
 SHOP_ITEMS_PER_PAGE = 5
 SHOP_VIEW_TIMEOUT = 120
 
-# ===== Конфигурация прав доступа =====
+# ===== Простые настройки доступа к командам =====
+# Укажите здесь ID ролей (int) или строку "Administrator", которым разрешено использовать команду.
+# Пустой список => команда доступна всем.
+ALLOWED_SHOP = []
+ALLOWED_CREATE_ITEM = ["Administrator", 1365552181020987492]
+ALLOWED_DELETE_ITEM = ["Administrator"]
+ALLOWED_BUY = []
+ALLOWED_SELL = ["Administrator"]
+ALLOWED_ITEM_INFO = []
+ALLOWED_INV = []
+ALLOWED_EXPORT = []
+ALLOWED_USE = []
+ALLOWED_GIVE_ITEM = ["Administrator", 1335508574335537192, 1335506833166827520]
+ALLOWED_TAKE_ITEM = ["Administrator"]
+ALLOWED_BALANCE = []
+ALLOWED_PAY = []
+ALLOWED_WORK = [1326654711918759988, 1326654711918759987, 1326654711905910793]
+ALLOWED_SET_WORK = ["Administrator"]
+
+# Новые права для денежных операций
+ALLOWED_ADD_MONEY = ["Administrator"]
+ALLOWED_REMOVE_MONEY = ["Administrator"]
+ALLOWED_RESET_MONEY = ["Administrator"]
+ALLOWED_ADD_MONEY_ROLE = ["Administrator"]
+ALLOWED_REMOVE_MONEY_ROLE = ["Administrator"]
+ALLOWED_RESET_MONEY_ROLE = ["Administrator"]
+
+# ===== Конфигурация Всемирного банка =====
 # УКАЖИТЕ ID роли Президента ниже:
 PRESIDENT_ROLE_ID = 123456789012345678  # Замените на реальный ID роли Президента
-
-# Экономика сервера
-ALLOWED_SHOP = permission_manager.register_flag(
-    "ALLOWED_SHOP",
-    label="!shop — магазин",
-    description="Просмотр ассортимента магазина и покупка товаров.",
-    defaults=[],
-    category="Магазин и инвентарь",
-    emoji="🛒",
-)
-ALLOWED_CREATE_ITEM = permission_manager.register_flag(
-    "ALLOWED_CREATE_ITEM",
-    label="!create-item — создание предметов",
-    description="Добавление новых предметов в магазин и инвентари.",
-    defaults=["Administrator", 1365552181020987492],
-    category="Магазин и инвентарь",
-    emoji="🛠️",
-)
-ALLOWED_EDIT_ITEM = permission_manager.register_flag(
-    "ALLOWED_EDIT_ITEM",
-    label="!edit-item — изменение предметов",
-    description="Редактирование существующих предметов магазина.",
-    defaults=["Administrator"],
-    category="Магазин и инвентарь",
-    emoji="🧩",
-)
-ALLOWED_DELETE_ITEM = permission_manager.register_flag(
-    "ALLOWED_DELETE_ITEM",
-    label="!delete-item — удаление предметов",
-    description="Удаление предметов из магазина и базы данных.",
-    defaults=["Administrator"],
-    category="Магазин и инвентарь",
-    emoji="🗑️",
-)
-ALLOWED_BUY = permission_manager.register_flag(
-    "ALLOWED_BUY",
-    label="!buy — покупка",
-    description="Покупка предметов из магазина участниками.",
-    defaults=[],
-    category="Магазин и инвентарь",
-    emoji="💳",
-)
-ALLOWED_SELL = permission_manager.register_flag(
-    "ALLOWED_SELL",
-    label="!sell — продажа",
-    description="Продажа предметов обратно магазину.",
-    defaults=[],
-    category="Магазин и инвентарь",
-    emoji="💰",
-)
-ALLOWED_ITEM_INFO = permission_manager.register_flag(
-    "ALLOWED_ITEM_INFO",
-    label="!item-info — информация",
-    description="Просмотр информации о предметах магазина.",
-    defaults=[],
-    category="Магазин и инвентарь",
-    emoji="ℹ️",
-)
-ALLOWED_INV = permission_manager.register_flag(
-    "ALLOWED_INV",
-    label="!inv — инвентарь",
-    description="Просмотр личного инвентаря участника.",
-    defaults=[],
-    category="Магазин и инвентарь",
-    emoji="🎒",
-)
-ALLOWED_EXPORT = permission_manager.register_flag(
-    "ALLOWED_EXPORT",
-    label="!export — экспорт",
-    description="Экспорт предметов из инвентаря по заявкам.",
-    defaults=[],
-    category="Магазин и инвентарь",
-    emoji="📦",
-)
-ALLOWED_USE = permission_manager.register_flag(
-    "ALLOWED_USE",
-    label="!use — использование",
-    description="Использование предметов из инвентаря.",
-    defaults=[],
-    category="Магазин и инвентарь",
-    emoji="🎯",
-)
-ALLOWED_GIVE_ITEM = permission_manager.register_flag(
-    "ALLOWED_GIVE_ITEM",
-    label="!give-item — выдача",
-    description="Выдача предметов другим участникам.",
-    defaults=["Administrator"],
-    category="Магазин и инвентарь",
-    emoji="🎁",
-)
-ALLOWED_TAKE_ITEM = permission_manager.register_flag(
-    "ALLOWED_TAKE_ITEM",
-    label="!take-item — изъятие",
-    description="Изъятие предметов у участников.",
-    defaults=["Administrator"],
-    category="Магазин и инвентарь",
-    emoji="📥",
-)
-ALLOWED_RESET_INVENTORY = permission_manager.register_flag(
-    "ALLOWED_RESET_INVENTORY",
-    label="!reset-inventory — очистка инвентаря",
-    description="Полная очистка инвентаря участника или роли.",
-    defaults=["Administrator"],
-    category="Магазин и инвентарь",
-    emoji="🧹",
-)
-
-# Денежная система и работа
-ALLOWED_BALANCE = permission_manager.register_flag(
-    "ALLOWED_BALANCE",
-    label="!balance — баланс",
-    description="Просмотр баланса своего или другого участника.",
-    defaults=[],
-    category="Экономика",
-    emoji="💼",
-)
-ALLOWED_PAY = permission_manager.register_flag(
-    "ALLOWED_PAY",
-    label="!pay — перевод",
-    description="Перевод денег между участниками.",
-    defaults=[],
-    category="Экономика",
-    emoji="🔁",
-)
-ALLOWED_WORK = permission_manager.register_flag(
-    "ALLOWED_WORK",
-    label="!work — работа",
-    description="Получение зарплаты через команду работы.",
-    defaults=[1326654711918759988, 1326654711918759987, 1326654711905910793],
-    category="Экономика",
-    emoji="🛠",
-)
-ALLOWED_SET_WORK = permission_manager.register_flag(
-    "ALLOWED_SET_WORK",
-    label="!set-work — настройка работы",
-    description="Настройка параметров работы и зарплат.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="⚙️",
-)
-ALLOWED_ADD_MONEY = permission_manager.register_flag(
-    "ALLOWED_ADD_MONEY",
-    label="!add-money — выдать деньги",
-    description="Выдача средств на баланс участника.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="➕",
-)
-ALLOWED_REMOVE_MONEY = permission_manager.register_flag(
-    "ALLOWED_REMOVE_MONEY",
-    label="!remove-money — забрать деньги",
-    description="Снятие средств с баланса участника.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="➖",
-)
-ALLOWED_RESET_MONEY = permission_manager.register_flag(
-    "ALLOWED_RESET_MONEY",
-    label="!reset-money — обнулить баланс",
-    description="Сброс баланса участника до нуля.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="🧨",
-)
-ALLOWED_ADD_MONEY_ROLE = permission_manager.register_flag(
-    "ALLOWED_ADD_MONEY_ROLE",
-    label="!add-money-role — выдать роли",
-    description="Выдача средств всем участникам роли.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="💸",
-)
-ALLOWED_REMOVE_MONEY_ROLE = permission_manager.register_flag(
-    "ALLOWED_REMOVE_MONEY_ROLE",
-    label="!remove-money-role — снять у роли",
-    description="Списание средств у участников роли.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="📉",
-)
-ALLOWED_RESET_MONEY_ROLE = permission_manager.register_flag(
-    "ALLOWED_RESET_MONEY_ROLE",
-    label="!reset-money-role — обнулить роль",
-    description="Обнуление балансов всех участников роли.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="🧾",
-)
-ALLOWED_ROLE_INCOME = permission_manager.register_flag(
-    "ALLOWED_ROLE_INCOME",
-    label="!role-income — доходные роли",
-    description="Настройка доходных ролей и их параметров.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="🏦",
-)
-ALLOWED_COLLECT = permission_manager.register_flag(
-    "ALLOWED_COLLECT",
-    label="!collect — сбор дохода",
-    description="Получение ежедневного дохода с ролей.",
-    defaults=[],
-    category="Экономика",
-    emoji="📬",
-)
-ALLOWED_INCOME_LIST = permission_manager.register_flag(
-    "ALLOWED_INCOME_LIST",
-    label="!income-list — список доходов",
-    description="Просмотр списка доступных доходных ролей.",
-    defaults=[],
-    category="Экономика",
-    emoji="📊",
-)
-ALLOWED_LOG_MENU = permission_manager.register_flag(
-    "ALLOWED_LOG_MENU",
-    label="!logmenu — настройки логов",
-    description="Открытие панели управления журналами.",
-    defaults=["Administrator"],
-    category="Экономика",
-    emoji="🗂️",
-)
-ALLOWED_ROLE_COMMANDS = permission_manager.register_flag(
-    "ALLOWED_ROLE_COMMANDS",
-    label="Команды ролей",
-    description="Доступ к управлению и синхронизации ролей через бота.",
-    defaults=["Administrator", 1365552181020987492],
-    category="Администрирование",
-    emoji="🔧",
-)
-
-# Всемирный банк и экономика государств
 DEFAULT_COMMISSION_PERCENT = 5  # по умолчанию 5%
-ALLOWED_WORLDBANK = permission_manager.register_flag(
-    "ALLOWED_WORLDBANK",
-    label="!worldbank — просмотр банка",
-    description="Просмотр состояния Всемирного банка.",
-    defaults=[],
-    category="Банк",
-    emoji="🌐",
-)
-ALLOWED_WORLDBANK_MANAGE = permission_manager.register_flag(
-    "ALLOWED_WORLDBANK_MANAGE",
-    label="!worldbank-manage — управление",
-    description="Настройка комиссий и пополнение Всемирного банка.",
-    defaults=["Administrator", PRESIDENT_ROLE_ID],
-    category="Банк",
-    emoji="💱",
-)
+ALLOWED_WORLDBANK = []  # просмотр доступен всем
+ALLOWED_WORLDBANK_MANAGE = ["Administrator", PRESIDENT_ROLE_ID]  # управлять могут админы и Президент
 
-# Управление странами и лицензиями
-ALLOWED_CREATE_COUNTRY = permission_manager.register_flag(
-    "ALLOWED_CREATE_COUNTRY",
-    label="!create-country — создать страну",
-    description="Создание новой страны в базе данных.",
-    defaults=["Administrator"],
-    category="Государства",
-    emoji="🗺️",
-)
-ALLOWED_EDIT_COUNTRY = permission_manager.register_flag(
-    "ALLOWED_EDIT_COUNTRY",
-    label="!edit-country — редактировать",
-    description="Редактирование параметров существующей страны.",
-    defaults=["Administrator"],
-    category="Государства",
-    emoji="✏️",
-)
-ALLOWED_DELETE_COUNTRY = permission_manager.register_flag(
-    "ALLOWED_DELETE_COUNTRY",
-    label="!delete-country — удалить",
-    description="Удаление страны из списка.",
-    defaults=["Administrator"],
-    category="Государства",
-    emoji="🗑️",
-)
-ALLOWED_COUNTRY_LIST = permission_manager.register_flag(
-    "ALLOWED_COUNTRY_LIST",
-    label="!country-list — список стран",
-    description="Просмотр свободных и занятых стран.",
-    defaults=[],
-    category="Государства",
-    emoji="📜",
-)
-ALLOWED_REG_COUNTRY = permission_manager.register_flag(
-    "ALLOWED_REG_COUNTRY",
-    label="!reg-country — закрепить",
-    description="Закрепление страны за участником.",
-    defaults=["Administrator"],
-    category="Государства",
-    emoji="📝",
-)
-ALLOWED_UNREG_COUNTRY = permission_manager.register_flag(
-    "ALLOWED_UNREG_COUNTRY",
-    label="!unreg-country — освободить",
-    description="Освобождение страны и снятие привязки.",
-    defaults=["Administrator"],
-    category="Государства",
-    emoji="🧾",
-)
-ALLOWED_LIC_INFO = permission_manager.register_flag(
-    "ALLOWED_LIC_INFO",
-    label="!lic-info — лицензии",
-    description="Просмотр информации по военным лицензиям.",
-    defaults=["Administrator"],
-    category="Государства",
-    emoji="🎖️",
-)
-ALLOWED_DELETE_LIC = permission_manager.register_flag(
-    "ALLOWED_DELETE_LIC",
-    label="!delete-lic — удалить лицензию",
-    description="Удаление лицензии из реестра.",
-    defaults=["Administrator"],
-    category="Государства",
-    emoji="⛔",
-)
+# ===== Доступ для доходных ролей и коллекта =====
+ALLOWED_ROLE_INCOME = ["Administrator"]  # кто может настраивать !role-income
+ALLOWED_COLLECT = []  # кто может использовать !collect (пусто = все)
+ALLOWED_LOG_MENU = ["Administrator"]  # кто может использовать !logmenu (пусто = все)
+ALLOWED_INCOME_LIST = []  # кто может использовать !income-list (пусто = все)
+ALLOWED_ROLE_COMMANDS = ["Administrator", 1365552181020987492]  # имя-метка под ваш permission-роутер
 
-# Прочие права административных команд
-ALLOWED_ADD_ROLE = permission_manager.register_flag(
-    "ALLOWED_ADD_ROLE",
-    label="!add-role — выдать роль",
-    description="Выдача ролей через интерфейс бота.",
-    defaults=["Administrator"],
-    category="Администрирование",
-    emoji="➕",
-)
-ALLOWED_TAKE_ROLE = permission_manager.register_flag(
-    "ALLOWED_TAKE_ROLE",
-    label="!take-role — забрать роль",
-    description="Удаление ролей у участников через бота.",
-    defaults=["Administrator"],
-    category="Администрирование",
-    emoji="➖",
-)
-ALLOWED_APANEL = permission_manager.register_flag(
-    "ALLOWED_APANEL",
-    label="!apanel — панель администратора",
-    description="Доступ к расширенной панели администратора.",
-    defaults=["Administrator"],
-    category="Администрирование",
-    emoji="🛡️",
-)
+# ===== Доступ для стран =====
+ALLOWED_CREATE_COUNTRY = ["Administrator"]
+ALLOWED_EDIT_COUNTRY = ["Administrator"]
+ALLOWED_DELETE_COUNTRY = ["Administrator"]
+ALLOWED_COUNTRY_LIST = []  # список доступен всем
+ALLOWED_REG_COUNTRY = ["Administrator"]
+ALLOWED_UNREG_COUNTRY = ["Administrator"]
 
-# Стоимость строительства военного завода (для создания лицензии)
-LICENSE_FACTORY_COST = 1000  # можете изменить стоимость по своему усмотрению
-
-# Стоимость передачи лицензии по типам вооружения
-# Измените значения в этом словаре, чтобы настроить рост цены
-LICENSE_PERMISSION_COSTS = {
-    "firearms": 100,
-    "transport_air": 150,
-    "military_air": 200,
-    "transport_fleet": 150,
-    "military_fleet": 250,
-    "ground_tech": 100,
-    "armor_tech": 200,
-    "artillery": 150,
-    "missiles": 300,
-    "air_def": 250,
-    "ammo": 50,
-}
-
-LICENSE_PERMISSION_LIST = [
-    ("firearms", "Огнестрельное оружие"),
-    ("transport_air", "Транспортная авиация"),
-    ("military_air", "Военная авиация"),
-    ("transport_fleet", "Транспортный флот"),
-    ("military_fleet", "Военный флот"),
-    ("ground_tech", "Наземная техника"),
-    ("armor_tech", "Бронетанковая техника"),
-    ("artillery", "Артиллерия"),
-    ("missiles", "Ракетные комплексы"),
-    ("air_def", "ПВО и ПРО"),
-    ("ammo", "Боеприпасы"),
-]
-
-# ID канала для подсчёта сообщений-новостей
-NEWS_CHANNEL_ID = 123456789012345678  # Замените на реальный ID канала
-# ID канала, на который будут отправляться заявки на создание техники 
-TECH_APPLICATION_CHANNEL_ID = 1373273403775127555 # Укажите идентификатор канала для заявок
-
-# ID канала, в который будет отправляться и обновляться список свободных стран
-FREE_COUNTRIES_CHANNEL_ID = 1373273403775127556  # Замените на реальный ID канала
-
-# ID канала, в который будет отправляться и обновляться список занятых стран
-OCCUPIED_COUNTRIES_CHANNEL_ID = 1409763660187828254  # Замените на реальный ID канала
-
-# Список континентов для отображения
-ALL_CONTINENTS = [
-    "Европа",
-    "Азия",
-    "Африка",
-    "Северная Америка",
-    "Южная Америка",
-    "Океания",
-]
-
-def is_user_allowed_for(
-    allowed: Union[list[Union[int, str]], PermissionFlag],
-    member: disnake.Member,
-) -> bool:
-    """Проверяет, есть ли у пользователя доступ по списку или permission-флагу."""
-    if isinstance(allowed, PermissionFlag):
-        guild = getattr(member, "guild", None)
-        if guild is None:
-            return allowed.default_everyone
-        return permission_manager.is_member_allowed(member, allowed)
+def is_user_allowed_for(allowed: list[Union[int, str]], member: disnake.Member) -> bool:
+    """
+    Возвращает True, если член сервера имеет доступ на основе списка allowed.
+    allowed: список из чисел (ID ролей) и/или строки "Administrator".
+    Пустой список => доступ всем.
+    """
     if not allowed:
         return True
+    # Разрешить администраторам, если явно указано "Administrator"
     if any(isinstance(x, str) and x.strip().lower() == "administrator" for x in allowed):
         if member.guild_permissions.administrator:
             return True
-    user_role_ids = {r.id for r in getattr(member, "roles", [])}
+    user_role_ids = {r.id for r in member.roles}
     for x in allowed:
-        if isinstance(x, int) and x in user_role_ids:
-            return True
-        if isinstance(x, str):
+        if isinstance(x, int):
+            if x in user_role_ids:
+                return True
+        elif isinstance(x, str):
             s = x.strip()
             if s.isdigit() and int(s) in user_role_ids:
                 return True
     return False
 
 
-async def ensure_allowed_ctx(
-    ctx: commands.Context,
-    allowed: Union[list[Union[int, str]], PermissionFlag],
-    *,
-    silent: bool = False,
-) -> bool:
-    """Проверяет доступ для автора команды. При отсутствии прав может выводить сообщение об ошибке."""
-    guild = ctx.guild
-
-    if isinstance(allowed, PermissionFlag):
-        if guild is None:
-            if allowed.default_everyone:
-                return True
-            if not silent:
-                await ctx.send(embed=error_embed("Доступ запрещён", "Эта команда доступна только на сервере."))
-            return False
-        if permission_manager.is_member_allowed(ctx.author, allowed):
-            return True
-        if not silent:
-            await ctx.send(embed=error_embed("Доступ запрещён", "У вас нет прав на использование этой команды."))
-        return False
-
-    if guild is None:
+async def ensure_allowed_ctx(ctx: commands.Context, allowed: list[Union[int, str]]) -> bool:
+    """Проверяет доступ для автора команды. Возвращает True если доступ разрешён, иначе отправляет сообщение и возвращает False."""
+    if not ctx.guild:
+        # В ЛС роли недоступны; если список пуст — разрешаем; иначе запрещаем.
         if not allowed:
             return True
-        if not silent:
-            await ctx.send(embed=error_embed("Доступ запрещён", "Эта команда должна использоваться на сервере."))
+        await ctx.send(embed=error_embed("Доступ запрещён", "Эта команда должна использоваться на сервере."))
         return False
-    
     if is_user_allowed_for(allowed, ctx.author):
         return True
-    if not silent:
-        await ctx.send(embed=error_embed("Доступ запрещён", "У вас нет прав на использование этой команды."))
+    await ctx.send(embed=error_embed("Доступ запрещён", "У вас нет прав на использование этой команды."))
     return False
 # ===============================================
 
@@ -859,7 +151,6 @@ USAGE_HINTS: dict[str, str] = {
     "income-list": "!income-list",
     # Логи
     "logmenu": "!logmenu",
-    "perms": "!perms",
 }
 
 def usage_embed(cmd_name: str) -> disnake.Embed:
@@ -899,43 +190,13 @@ def setup_database():
         )
     """)
 
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS country_balances (
-            guild_id INTEGER,
-            code TEXT,
-            balance INTEGER DEFAULT 0,
-            PRIMARY KEY (guild_id, code)
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS country_inventories (
-            guild_id INTEGER,
-            code TEXT,
-            item_id INTEGER,
-            quantity INTEGER DEFAULT 0,
-            PRIMARY KEY (guild_id, code, item_id)
-        )
-    """)
-
     # Рекомендуемый индекс для быстрых запросов топа по балансу
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_balances_guild_balance
         ON balances (guild_id, balance DESC)
     """)
 
-    # Таблица кастомных прав доступа
-    cursor.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {PermissionManager.TABLE_NAME} (
-            guild_id INTEGER NOT NULL,
-            flag TEXT NOT NULL,
-            target_type TEXT NOT NULL,
-            target_id INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (guild_id, flag, target_type, target_id)
-        )
-        """
-    )
+    # УДАЛЕНО: таблица permissions и всё связанное с ней
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS work_settings (
@@ -969,9 +230,11 @@ def setup_database():
         CREATE TABLE IF NOT EXISTS role_incomes (
             guild_id INTEGER,
             role_id INTEGER,
-            income_type TEXT NOT NULL,       -- 'money' | 'items'
-            money_amount INTEGER DEFAULT 0,  -- если income_type='money'
-            items_json TEXT,                 -- JSON: [{"item_id": int, "qty": int}, ...] если income_type='items'
+            income_type TEXT NOT NULL,            -- 'money' | 'items'
+            money_amount INTEGER DEFAULT 0,       -- абсолютное значение суммы/процента
+            money_is_percent INTEGER NOT NULL DEFAULT 0,
+            money_is_debit INTEGER NOT NULL DEFAULT 0,
+            items_json TEXT,                      -- JSON: [{"item_id": int, "qty": int}, ...] если income_type='items'
             cooldown_seconds INTEGER NOT NULL DEFAULT 86400,
             PRIMARY KEY (guild_id, role_id)
         )
@@ -988,34 +251,11 @@ def setup_database():
         )
     """)
 
-    # Доходные роли: кулдауны по стране
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS country_role_income_cooldowns (
-            guild_id INTEGER,
-            role_id INTEGER,
-            code TEXT,
-            last_ts INTEGER,
-            PRIMARY KEY (guild_id, role_id, code)
-        )
-    """)
-
 # Логи доходных ролей: конфигурация канала логов
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS guild_logs (
             guild_id INTEGER PRIMARY KEY,
             role_income_log_channel_id INTEGER
-        )
-    """)
-
-    # Типы техники
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tech_types (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER,
-            name TEXT,
-            branch TEXT,
-            price INTEGER DEFAULT 0,
-            required_items TEXT
         )
     """)
 
@@ -1065,35 +305,26 @@ def safe_int(v: int, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQ
 def get_top_balances(guild_id: int, limit: int, offset: int = 0) -> List[Tuple[int, int]]:
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    cursor.execute("SELECT user_id, balance FROM balances WHERE guild_id = ?", (guild_id,))
+    cursor.execute("""
+        SELECT user_id, balance
+        FROM balances
+        WHERE guild_id = ?
+        ORDER BY balance DESC, user_id ASC
+        LIMIT ? OFFSET ?
+    """, (guild_id, limit, offset))
     rows = cursor.fetchall()
-    cursor.execute(
-        """
-        SELECT COALESCE(cr.user_id, 0) AS user_id, cb.balance
-        FROM country_balances AS cb
-        LEFT JOIN country_registrations AS cr
-          ON cr.guild_id = cb.guild_id AND UPPER(cr.code)=UPPER(cb.code)
-        WHERE cb.guild_id = ?
-        """,
-        (guild_id,),
-    )
-    rows += cursor.fetchall()
     conn.close()
-    rows.sort(key=lambda r: (-int(r[1]), int(r[0])))
-    return rows[offset:offset + limit]
+    return rows
 
 
 def get_balances_count(guild_id: int) -> int:
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM balances WHERE guild_id = ?", (guild_id,))
-    result_u = cursor.fetchone()
-    cursor.execute("SELECT COUNT(*) FROM country_balances WHERE guild_id = ?", (guild_id,))
-    result_c = cursor.fetchone()
+    result = cursor.fetchone()
+    total = result[0] if result and result[0] is not None else 0
     conn.close()
-    total_u = result_u[0] if result_u and result_u[0] is not None else 0
-    total_c = result_c[0] if result_c and result_c[0] is not None else 0
-    return int(total_u + total_c)
+    return total
 
 # >>> ДОБАВИТЬ ПОСЛЕ СОЗДАНИЯ ТАБЛИЦ И ПЕРЕД conn.commit()
 def ensure_role_incomes_extra_columns():
@@ -1107,6 +338,10 @@ def ensure_role_incomes_extra_columns():
         c.execute("ALTER TABLE role_incomes ADD COLUMN created_by INTEGER")
     if "created_ts" not in cols:
         c.execute("ALTER TABLE role_incomes ADD COLUMN created_ts INTEGER")
+    if "money_is_percent" not in cols:
+        c.execute("ALTER TABLE role_incomes ADD COLUMN money_is_percent INTEGER NOT NULL DEFAULT 0")
+    if "money_is_debit" not in cols:
+        c.execute("ALTER TABLE role_incomes ADD COLUMN money_is_debit INTEGER NOT NULL DEFAULT 0")
 
     conn.commit()
     conn.close()
@@ -1137,83 +372,34 @@ def migrate_roles_columns():
 def get_balance(guild_id: int, user_id: int) -> int:
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        cursor.execute(
-            "SELECT balance FROM country_balances WHERE guild_id = ? AND code = ?",
-            (guild_id, code),
-        )
-        result = cursor.fetchone()
-        if result:
-            balance = result[0]
-        else:
-            cursor.execute(
-                "INSERT INTO country_balances (guild_id, code, balance) VALUES (?, ?, 0)",
-                (guild_id, code),
-            )
-            conn.commit()
-            balance = 0
+    cursor.execute("SELECT balance FROM balances WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+    result = cursor.fetchone()
+    if result:
+        balance = result[0]
     else:
-        cursor.execute(
-            "SELECT balance FROM balances WHERE guild_id = ? AND user_id = ?",
-            (guild_id, user_id),
-        )
-        result = cursor.fetchone()
-        if result:
-            balance = result[0]
-        else:
-            cursor.execute(
-                "INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, 0)",
-                (guild_id, user_id),
-            )
-            conn.commit()
-            balance = 0
+        cursor.execute("INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)", (guild_id, user_id, 0))
+        conn.commit()
+        balance = 0
     conn.close()
     return balance
 
 def update_balance(guild_id: int, user_id: int, amount: int):
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        cursor.execute(
-            """
-            INSERT INTO country_balances (guild_id, code, balance) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, code) DO UPDATE SET balance = balance + ?
-            """,
-            (guild_id, code, amount, amount),
-        )
-    else:
-        cursor.execute(
-            """
-            INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = balance + ?
-            """,
-            (guild_id, user_id, amount, amount),
-        )
+    cursor.execute("""
+        INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = balance + ?
+    """, (guild_id, user_id, amount, amount))
     conn.commit()
     conn.close()
 
 def set_balance(guild_id: int, user_id: int, new_balance: int):
     conn = sqlite3.connect(get_db_path())
     cursor = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        cursor.execute(
-            """
-            INSERT INTO country_balances (guild_id, code, balance) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, code) DO UPDATE SET balance = excluded.balance
-            """,
-            (guild_id, code, new_balance),
-        )
-    else:
-        cursor.execute(
-            """
-            INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
-            ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = excluded.balance
-            """,
-            (guild_id, user_id, new_balance),
-        )
+    cursor.execute("""
+        INSERT INTO balances (guild_id, user_id, balance) VALUES (?, ?, ?)
+        ON CONFLICT(guild_id, user_id) DO UPDATE SET balance = excluded.balance
+    """, (guild_id, user_id, new_balance))
     conn.commit()
     conn.close()
 
@@ -1226,21 +412,12 @@ def admin_reset_inventories(guild_id: int) -> tuple[int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute(
-        "SELECT COUNT(*), COUNT(DISTINCT code) FROM country_inventories WHERE guild_id = ?",
-        (guild_id,),
-    )
-    total_rows_c, countries = c.fetchone() or (0, 0)
-    c.execute("DELETE FROM country_inventories WHERE guild_id = ?", (guild_id,))
-    c.execute(
-        "SELECT COUNT(*), COUNT(DISTINCT user_id) FROM inventories WHERE guild_id = ?",
-        (guild_id,),
-    )
-    total_rows_u, users = c.fetchone() or (0, 0)
+    c.execute("SELECT COUNT(*), COUNT(DISTINCT user_id) FROM inventories WHERE guild_id = ?", (guild_id,))
+    total_rows, users = c.fetchone() or (0, 0)
     c.execute("DELETE FROM inventories WHERE guild_id = ?", (guild_id,))
     conn.commit()
     conn.close()
-    return int((total_rows_c or 0) + (total_rows_u or 0)), int((countries or 0) + (users or 0))
+    return int(total_rows or 0), int(users or 0)
 
 def admin_reset_balances(guild_id: int) -> tuple[int, int, int]:
     """
@@ -1249,33 +426,13 @@ def admin_reset_balances(guild_id: int) -> tuple[int, int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    c.execute(
-        "SELECT COUNT(*), COALESCE(SUM(balance),0) FROM country_balances WHERE guild_id = ?",
-        (guild_id,),
-    )
-    total_rows_c, sum_before_c = c.fetchone() or (0, 0)
-    c.execute(
-        "UPDATE country_balances SET balance = 0 WHERE guild_id = ? AND balance != 0",
-        (guild_id,),
-    )
-    affected_c = c.rowcount or 0
-    c.execute(
-        "SELECT COUNT(*), COALESCE(SUM(balance),0) FROM balances WHERE guild_id = ?",
-        (guild_id,),
-    )
-    total_rows_u, sum_before_u = c.fetchone() or (0, 0)
-    c.execute(
-        "UPDATE balances SET balance = 0 WHERE guild_id = ? AND balance != 0",
-        (guild_id,),
-    )
-    affected_u = c.rowcount or 0
+    c.execute("SELECT COUNT(*), COALESCE(SUM(balance),0) FROM balances WHERE guild_id = ?", (guild_id,))
+    total_rows, sum_before = c.fetchone() or (0, 0)
+    c.execute("UPDATE balances SET balance = 0 WHERE guild_id = ? AND balance != 0", (guild_id,))
+    affected = c.rowcount or 0
     conn.commit()
     conn.close()
-    return (
-        int(affected_c + affected_u),
-        int((total_rows_c or 0) + (total_rows_u or 0)),
-        int((sum_before_c or 0) + (sum_before_u or 0)),
-    )
+    return int(affected), int(total_rows or 0), int(sum_before or 0)
 
 def admin_reset_worldbank(guild_id: int) -> tuple[int, int]:
     """
@@ -1319,27 +476,11 @@ def admin_clear_shop(guild_id: int) -> dict:
     if item_ids:
         # Сколько записей инвентарей будет удалено
         placeholders = ",".join("?" for _ in item_ids)
-        c.execute(
-            f"SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
-            (guild_id, *item_ids),
-        )
-        inv_rows_user = int(c.fetchone()[0] or 0)
-        c.execute(
-            f"SELECT COUNT(*) FROM country_inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
-            (guild_id, *item_ids),
-        )
-        inv_rows_country = int(c.fetchone()[0] or 0)
-        stats["inv_rows"] = inv_rows_user + inv_rows_country
+        c.execute(f"SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})", (guild_id, *item_ids))
+        stats["inv_rows"] = int(c.fetchone()[0] or 0)
 
         # Удалить инвентари по этим предметам
-        c.execute(
-            f"DELETE FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
-            (guild_id, *item_ids),
-        )
-        c.execute(
-            f"DELETE FROM country_inventories WHERE guild_id = ? AND item_id IN ({placeholders})",
-            (guild_id, *item_ids),
-        )
+        c.execute(f"DELETE FROM inventories WHERE guild_id = ? AND item_id IN ({placeholders})", (guild_id, *item_ids))
 
     # Состояние магазина
     c.execute("SELECT COUNT(*) FROM item_shop_state WHERE guild_id = ?", (guild_id,))
@@ -1372,10 +513,6 @@ def admin_clear_role_incomes(guild_id: int) -> tuple[int, int]:
     c.execute("SELECT COUNT(*) FROM role_income_cooldowns WHERE guild_id = ?", (guild_id,))
     cds_deleted = int(c.fetchone()[0] or 0)
     c.execute("DELETE FROM role_income_cooldowns WHERE guild_id = ?", (guild_id,))
-
-    c.execute("SELECT COUNT(*) FROM country_role_income_cooldowns WHERE guild_id = ?", (guild_id,))
-    cds_deleted += int(c.fetchone()[0] or 0)
-    c.execute("DELETE FROM country_role_income_cooldowns WHERE guild_id = ?", (guild_id,))
 
     conn.commit()
     conn.close()
@@ -1463,30 +600,12 @@ def setup_country_tables():
             UNIQUE (guild_id, user_id)
         )
     """)
-    
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS country_license_permissions (
-            guild_id INTEGER,
-            license_code TEXT,
-            country_code TEXT,
-            permissions TEXT,
-            PRIMARY KEY (guild_id, license_code, country_code)
-        )
-    """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_countries_name ON countries (guild_id, name)")
-    # Миграция дополнительных колонок
+    # Миграция license_role_id
     c.execute("PRAGMA table_info(countries)")
     cols = {row[1] for row in c.fetchall()}
     if "license_role_id" not in cols:
         c.execute("ALTER TABLE countries ADD COLUMN license_role_id INTEGER")
-    if "licenses" not in cols:
-        c.execute("ALTER TABLE countries ADD COLUMN licenses TEXT")
-    if "government_form" not in cols:
-        c.execute("ALTER TABLE countries ADD COLUMN government_form TEXT")
-    if "ideology" not in cols:
-        c.execute("ALTER TABLE countries ADD COLUMN ideology TEXT")
-    if "religion" not in cols:
-        c.execute("ALTER TABLE countries ADD COLUMN religion TEXT")
     conn.commit()
     conn.close()
 
@@ -1499,6 +618,7 @@ async def _countries_reviews_on_ready():
     
 CONTINENTS = [
     "Африка",
+    "Антарктида",
     "Азия",
     "Европа",
     "Северная Америка",
@@ -1524,14 +644,7 @@ def country_get_by_code_or_name(guild_id: int, code_or_name: str) -> Optional[di
         c.execute("SELECT * FROM countries WHERE guild_id=? AND lower(name)=lower(?)", (guild_id, q))
         row = c.fetchone()
     conn.close()
-    if not row:
-        return None
-    info = dict(row)
-    try:
-        info["licenses"] = json.loads(info.get("licenses") or "[]")
-    except Exception:
-        info["licenses"] = []
-    return info
+    return dict(row) if row else None
 
 def country_exists_code(guild_id: int, code: str) -> bool:
     conn = sqlite3.connect(get_db_path())
@@ -1630,14 +743,6 @@ def normalize_flag_emoji(flag_raw: str, code_hint: Optional[str] = None) -> str:
     # Если уже юникод-флаг — возвращаем как есть
     return s
 
-
-def build_country_license_name(info: dict) -> str:
-    """Формирует отображаемое название лицензии страны."""
-    flag = normalize_flag_emoji(info.get("flag"), code_hint=info.get("code"))
-    name = info.get("name") or ""
-    code = info.get("code") or ""
-    return f"[{flag}] Лицензия {name} ({code})"
-
 def country_get_registration_for_user(guild_id: int, user_id: int) -> Optional[str]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
@@ -1646,17 +751,6 @@ def country_get_registration_for_user(guild_id: int, user_id: int) -> Optional[s
     conn.close()
     return row[0] if row else None
 
-def country_get_registration_info(guild_id: int, user_id: int) -> Optional[tuple[str, int]]:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        "SELECT code, registered_ts FROM country_registrations WHERE guild_id=? AND user_id=?",
-        (guild_id, user_id),
-    )
-    row = c.fetchone()
-    conn.close()
-    return (row[0], int(row[1])) if row else None
-
 def country_get_occupant(guild_id: int, code: str) -> Optional[int]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
@@ -1664,143 +758,6 @@ def country_get_occupant(guild_id: int, code: str) -> Optional[int]:
     row = c.fetchone()
     conn.close()
     return int(row[0]) if row else None
-
-
-def country_get_licenses(guild_id: int, code: str) -> list[str]:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        "SELECT licenses FROM countries WHERE guild_id=? AND upper(code)=upper(?)",
-        (guild_id, code.strip().upper()),
-    )
-    row = c.fetchone()
-    conn.close()
-    if not row or not row[0]:
-        return []
-    try:
-        data = json.loads(row[0])
-        return [str(x) for x in data] if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def country_add_license(guild_id: int, code: str, license_code: str) -> None:
-    licenses = country_get_licenses(guild_id, code)
-    if license_code not in licenses:
-        licenses.append(license_code)
-        conn = sqlite3.connect(get_db_path())
-        c = conn.cursor()
-        c.execute(
-            "UPDATE countries SET licenses=?, updated_ts=? WHERE guild_id=? AND upper(code)=upper(?)",
-            (json.dumps(licenses), _now_ts(), guild_id, code.strip().upper()),
-        )
-        conn.commit()
-        conn.close()
-
-
-def country_has_license(guild_id: int, code: str, license_code: str) -> bool:
-    licenses = country_get_licenses(guild_id, code)
-    return license_code in licenses
-
-
-def country_remove_license(guild_id: int, license_code: str) -> None:
-    """Удаляет указанный код лицензии из всех стран гильдии."""
-    license_code = license_code.strip().upper()
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute("SELECT code, licenses FROM countries WHERE guild_id=?", (guild_id,))
-    rows = c.fetchall()
-    ts = _now_ts()
-    for code, lic_json in rows:
-        if not lic_json:
-            continue
-        try:
-            licenses = json.loads(lic_json) or []
-        except Exception:
-            licenses = []
-        if license_code in licenses:
-            licenses = [l for l in licenses if l != license_code]
-            c.execute(
-                "UPDATE countries SET licenses=?, updated_ts=? WHERE guild_id=? AND upper(code)=upper(?)",
-                (json.dumps(licenses), ts, guild_id, code.strip().upper()),
-            )
-    conn.commit()
-    conn.close()
-
-
-def license_permissions_get(
-    guild_id: int, license_code: str, country_code: str
-) -> dict:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        "SELECT permissions FROM country_license_permissions WHERE guild_id=? AND upper(license_code)=upper(?) AND upper(country_code)=upper(?)",
-        (guild_id, license_code.strip().upper(), country_code.strip().upper()),
-    )
-    row = c.fetchone()
-    conn.close()
-    try:
-        return json.loads(row[0]) if row and row[0] else {}
-    except Exception:
-        return {}
-
-
-def license_permissions_set(
-    guild_id: int, license_code: str, country_code: str, perms: dict
-) -> None:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO country_license_permissions (guild_id, license_code, country_code, permissions)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(guild_id, license_code, country_code)
-        DO UPDATE SET permissions=excluded.permissions
-        """,
-        (
-            guild_id,
-            license_code.strip().upper(),
-            country_code.strip().upper(),
-            json.dumps(perms),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
-def country_update_system(
-    guild_id: int,
-    code: str,
-    *,
-    form: Optional[str] = None,
-    ideology: Optional[str] = None,
-    religion: Optional[str] = None,
-) -> None:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    fields = []
-    params: list = []
-    if form is not None:
-        fields.append("government_form=?")
-        params.append(form)
-    if ideology is not None:
-        fields.append("ideology=?")
-        params.append(ideology)
-    if religion is not None:
-        fields.append("religion=?")
-        params.append(religion)
-    if not fields:
-        conn.close()
-        return
-    fields.append("updated_ts=?")
-    params.append(_now_ts())
-    params.extend([guild_id, code.strip().upper()])
-    c.execute(
-        f"UPDATE countries SET {', '.join(fields)} WHERE guild_id=? AND upper(code)=upper(?)",
-        params,
-    )
-    conn.commit()
-    conn.close()
 
 def country_delete(guild_id: int, code_or_name: str) -> tuple[bool, str | None, Optional[str]]:
     """
@@ -1821,8 +778,6 @@ def country_delete(guild_id: int, code_or_name: str) -> tuple[bool, str | None, 
         conn.close()
         return False, f"Ошибка удаления: {e}", None
     conn.close()
-    # Удаляем связанные лицензии
-    country_remove_license(guild_id, code)
     return True, None, code
 
 def countries_list_all(guild_id: int) -> list[dict]:
@@ -1837,10 +792,6 @@ def countries_list_all(guild_id: int) -> list[dict]:
     conn.close()
     for r in rows:
         r["registered_user_id"] = reg.get((r["code"] or "").upper())
-        try:
-            r["licenses"] = json.loads(r.get("licenses") or "[]")
-        except Exception:
-            r["licenses"] = []
     return rows
 
 def country_register_user(guild_id: int, code: str, user_id: int) -> tuple[bool, str | None]:
@@ -2025,11 +976,11 @@ class SeaAccessSelectView(disnake.ui.View):
 
 # ===== Вью выбора лицензии (универсальная) =====
 
-def build_license_pick_embed(invoker: disnake.Member, title: str = "Выбор лицензии", current_license: Optional[str] = None) -> disnake.Embed:
-    cur_txt = f"Текущая: {current_license}\n" if current_license else ""
+def build_license_pick_embed(invoker: disnake.Member, title: str = "Выбор роли лицензии", current_role_id: Optional[int] = None) -> disnake.Embed:
+    cur_txt = f"Текущая: <@&{current_role_id}>\n" if current_role_id else ""
     e = disnake.Embed(
         title=title,
-        description=(cur_txt + "Выберите лицензию и нажмите «Подтвердить»."),
+        description=(cur_txt + "Выберите роль (можно искать) и нажмите «Подтвердить»."),
         color=disnake.Color.from_rgb(88, 101, 242)
     )
     e.set_author(name=invoker.display_name, icon_url=invoker.display_avatar.url)
@@ -2106,91 +1057,10 @@ class LicenseRolePickView(disnake.ui.View):
             return False
         return True
 
-
-class CountryLicensePickView(disnake.ui.View):
-    """Выбор лицензии из списка стран."""
-
-    def __init__(
-        self,
-        ctx: commands.Context,
-        on_pick,
-        current_code: Optional[str] = None,
-        timeout: float = 120.0,
-    ):
-        super().__init__(timeout=timeout)
-        self.ctx = ctx
-        self.on_pick = on_pick
-        self.current_code = current_code
-        self.message: Optional[disnake.Message] = None
-        self._chosen_code: Optional[str] = None
-
-        rows = [r for r in countries_list_all(ctx.guild.id) if r.get("licenses") and r["code"] in r["licenses"]]
-        options: list[disnake.SelectOption] = [
-            disnake.SelectOption(
-                label=build_country_license_name(r)[:100],
-                value=str(r["code"]),
-            )
-            for r in rows
-        ]
-        options.insert(0, disnake.SelectOption(label="Без лицензии", value="none"))
-
-        self.select = disnake.ui.StringSelect(
-            custom_id="country_license_pick",
-            placeholder="Выберите лицензию",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-        self.btn_confirm = disnake.ui.Button(
-            label="Подтвердить", style=disnake.ButtonStyle.primary, custom_id="country_license_confirm"
-        )
-        self.btn_cancel = disnake.ui.Button(
-            label="Отмена", style=disnake.ButtonStyle.secondary, custom_id="country_license_cancel"
-        )
-
-        async def on_select(i: disnake.MessageInteraction):
-            self._chosen_code = self.select.values[0]
-            await i.response.defer()
-
-        async def on_confirm(i: disnake.MessageInteraction):
-            if self._chosen_code is None:
-                return await i.response.send_message("Сначала выберите лицензию.", ephemeral=True)
-            code = None if self._chosen_code == "none" else self._chosen_code
-            await self.on_pick(code, i)
-            if code is None:
-                name = "Без лицензии"
-            else:
-                match = next((r for r in rows if r["code"] == code), None)
-                name = build_country_license_name(match) if match else code
-            try:
-                await i.response.edit_message(content=f"✅ Лицензия выбрана: {name}", embed=None, view=None)
-            except Exception:
-                await i.followup.send(f"✅ Лицензия выбрана: {name}", ephemeral=True)
-
-        async def on_cancel(i: disnake.MessageInteraction):
-            try:
-                await i.response.edit_message(content="Отменено.", view=None, embed=None)
-            except Exception:
-                await i.followup.send("Отменено.", ephemeral=True)
-
-        self.select.callback = on_select
-        self.btn_confirm.callback = on_confirm
-        self.btn_cancel.callback = on_cancel
-
-        self.add_item(self.select)
-        self.add_item(self.btn_confirm)
-        self.add_item(self.btn_cancel)
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        if inter.user.id != self.ctx.author.id:
-            await inter.response.send_message("Это меню не для вас.", ephemeral=True)
-            return False
-        return True
-
     async def on_timeout(self):
         try:
             for c in self.children:
-                if hasattr(c, "disabled"):
+                if isinstance(c, (disnake.ui.Button, disnake.ui.SelectBase)):
                     c.disabled = True
             if self.message:
                 await self.message.edit(view=self)
@@ -2324,11 +1194,10 @@ class CountryWizard(disnake.ui.View):
                 with contextlib.suppress(Exception):
                     await self.message.edit(embed=self.build_embed(), view=self)
 
-        cur = f"<@&{self.draft.license_role_id}>" if self.draft.license_role_id else None
         emb = build_license_pick_embed(
             invoker=inter.user,
             title="Выбор роли лицензии для страны",
-            current_license=cur,
+            current_role_id=self.draft.license_role_id
         )
 
         picker = LicenseRolePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
@@ -2574,7 +1443,7 @@ class CountryListView(disnake.ui.View):
             if uid:
                 m = self.ctx.guild.get_member(int(uid))
                 user_txt = (m.mention if m else f"<@{uid}>")
-            lic_txt = "Есть" if r.get("licenses") and r["code"] in r["licenses"] else "—"
+            lic_txt = f"<@&{int(r['license_role_id'])}>" if r.get("license_role_id") else "—"
             sea = _fmt_bool(bool(r.get("sea_access"))) if r.get("sea_access") is not None else "—"
             blocks.append(
                 "\n".join([
@@ -2675,7 +1544,7 @@ async def reg_country_cmd(ctx: commands.Context, member: disnake.Member, code: s
     e.add_field(name="Население", value=f"{format_number(info.get('population') or 0)}", inline=True)
     sea = _fmt_bool(bool(info.get("sea_access"))) if info.get("sea_access") is not None else "—"
     e.add_field(name="Выход в море", value=sea, inline=True)
-    lic_txt = "Есть" if info.get("licenses") and info["code"] in info["licenses"] else "—"
+    lic_txt = f"<@&{int(info['license_role_id'])}>" if info.get("license_role_id") else "—"
     e.add_field(name="Лицензия", value=lic_txt, inline=True)
     await ctx.send(embed=e)
 
@@ -2686,8 +1555,18 @@ async def reg_country_cmd(ctx: commands.Context, member: disnake.Member, code: s
     with contextlib.suppress(Exception):
         await member.edit(nick=desired, reason="Регистрация на страну")
 
-    await send_free_countries_update()
-    await send_occupied_countries_update()
+    # Выдача лицензии страны
+    lic_id = info.get("license_role_id")
+    if lic_id:
+        role = ctx.guild.get_role(int(lic_id))
+        if role:
+            can, why = _bot_can_apply(ctx.guild, role, member)
+            if can:
+                with contextlib.suppress(Exception):
+                    await member.add_roles(role, reason="Регистрация на страну — выдача лицензии страны")
+            else:
+                # Не критично: просто сообщим в консоль/лог
+                print(f"[reg-country] Не удалось выдать роль лицензии: {why}")
 
 @bot.command(name="unreg-country")
 async def unreg_country_cmd(ctx: commands.Context, member: disnake.Member):
@@ -2702,9 +1581,6 @@ async def unreg_country_cmd(ctx: commands.Context, member: disnake.Member):
     if code:
         e.set_footer(text=f"Код страны: {code}")
     await ctx.send(embed=e)
-    
-    await send_free_countries_update()
-    await send_occupied_countries_update()
     
 @bot.command(name="country-user")
 async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
@@ -2740,1296 +1616,6 @@ async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
     e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
     await ctx.send(embed=e)
 # ============================================
-
-# --- Автоматическая регистрация ---
-
-
-def _reg_menu_embed(guild: disnake.Guild) -> disnake.Embed:
-    """Основное сообщение выбора типа регистрации."""
-    emb = disnake.Embed(
-        title="Регистрация",
-        description="для регистрации выбери в меню выбора тип регистрации.",
-        color=disnake.Color.blurple(),
-    )
-    emb.set_author(name=guild.name, icon_url=getattr(guild.icon, "url", None))
-    return emb
-
-
-def _country_help_embed(guild: disnake.Guild) -> disnake.Embed:
-    lines = [
-        "**Подсказки:**",
-        "- Нажмите кнопку \"Регистрация\" для самостоятельного выбора страны",
-        "- После нажатия кнопки введите буквенный код страны, флаг страны или же её название.",
-        "- После отправления заявки вы автоматически зарегистрируетесь на выбранную вами страну в случае, если она не занята",
-        "",
-        "**Случайный выбор**",
-        "- Нажмите кнопку \"Случайный выбор\" для регистрации на рандомно выбранную свободную страну.",
-    ]
-    emb = disnake.Embed(title="Страна", description="\n".join(lines), color=disnake.Color.blurple())
-    emb.set_author(name=guild.name, icon_url=getattr(guild.icon, "url", None))
-    return emb
-
-
-def _confirm_embed(guild: disnake.Guild, info: dict) -> disnake.Embed:
-    flag_disp = normalize_flag_emoji(info.get("flag") or "", code_hint=info.get("code"))
-    emb = disnake.Embed(
-        title="Подтверждение",
-        description=f"Вы уверены, что хотите зарегистрироваться на страну {flag_disp} | {info['name']}?",
-        color=disnake.Color.yellow(),
-    )
-    emb.set_author(name=guild.name, icon_url=getattr(guild.icon, "url", None))
-    return emb
-
-
-class ConfirmRegisterView(disnake.ui.View):
-    def __init__(self, info: dict):
-        super().__init__(timeout=INV_PERMISSION_TIMEOUT)
-        self.info = info
-
-    @disnake.ui.button(label="Подтвердить", style=disnake.ButtonStyle.success)
-    async def confirm(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        guild = inter.guild
-        if not guild:
-            return
-        user = inter.user
-        existing = country_get_registration_for_user(guild.id, user.id)
-        if existing:
-            ex = country_get_by_code_or_name(guild.id, existing)
-            flag = ex.get("flag") or ""
-            name = ex.get("name") or existing
-            await inter.response.send_message(
-                embed=error_embed(
-                    "Неудачная регистрация",
-                    f"Вы уже зарегистрированы на страну {flag} | {name} ({existing}).",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        occupant_id = country_get_occupant(guild.id, self.info["code"])
-        if occupant_id and occupant_id != user.id:
-            flag = self.info.get("flag") or ""
-            name = self.info.get("name") or self.info["code"]
-            await inter.response.send_message(
-                embed=error_embed(
-                    "Страна занята",
-                    f"Страна {flag} | {name} уже занята другим пользователем. Выберите другую страну.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        ok, err = country_register_user(guild.id, self.info["code"], user.id)
-        if not ok:
-            await inter.response.send_message(
-                embed=error_embed("Регистрация не выполнена", err or "Ошибка"),
-                ephemeral=True,
-            )
-            return
-
-        flag_disp = normalize_flag_emoji(self.info.get("flag") or "", code_hint=self.info.get("code"))
-        emb = disnake.Embed(
-            title="✅ Успешная регистрация",
-            description=f"Вы зарегистрированы на страну: {flag_disp} {self.info['name']} ({self.info['code']})",
-            color=disnake.Color.green(),
-        )
-        emb.set_author(name=guild.name, icon_url=getattr(guild.icon, "url", None))
-        await inter.response.send_message(embed=emb, ephemeral=True)
-
-        desired = f"{flag_disp} | {self.info['name']}"
-        if len(desired) > 32:
-            desired = desired[:32]
-        with contextlib.suppress(Exception):
-            await user.edit(nick=desired, reason="Регистрация на страну")
-
-        await send_free_countries_update()
-        await send_occupied_countries_update()
-
-    @disnake.ui.button(label="Отмена", style=disnake.ButtonStyle.secondary)
-    async def cancel(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_message("Регистрация отменена.", ephemeral=True)
-
-
-class CountryModal(disnake.ui.Modal):
-    def __init__(self):
-        components = [
-            disnake.ui.TextInput(label="Страна", custom_id="country", placeholder="код/флаг/название"),
-        ]
-        super().__init__(title="Регистрация", components=components)
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        value = inter.text_values.get("country", "").strip()
-        info = country_get_by_code_or_name(inter.guild.id, value)
-        if not info:
-            await inter.response.send_message(embed=error_embed("Ошибка", "Страна не найдена."), ephemeral=True)
-            return
-        emb = _confirm_embed(inter.guild, info)
-        view = ConfirmRegisterView(info)
-        await inter.response.send_message(embed=emb, view=view, ephemeral=True)
-
-
-class CountryRegisterView(disnake.ui.View):
-    def __init__(self):
-        super().__init__(timeout=INV_PERMISSION_TIMEOUT)
-
-    @disnake.ui.button(label="Регистрация", style=disnake.ButtonStyle.primary)
-    async def manual(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_modal(CountryModal())
-
-    @disnake.ui.button(label="Случайный выбор", style=disnake.ButtonStyle.secondary)
-    async def random(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        rows = [r for r in countries_list_all(inter.guild.id) if not r.get("registered_user_id")]
-        if not rows:
-            await inter.response.send_message(
-                embed=error_embed("Ошибка", "Нет свободных стран."),
-                ephemeral=True,
-            )
-            return
-        info = random.choice(rows)
-        emb = _confirm_embed(inter.guild, info)
-        view = ConfirmRegisterView(info)
-        await inter.response.send_message(embed=emb, view=view, ephemeral=True)
-
-
-class RegistrationView(disnake.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @disnake.ui.string_select(
-        placeholder="Выберите тип регистрации",
-        options=[disnake.SelectOption(label="Страна", value="country")],
-    )
-    async def select(self, select: disnake.ui.StringSelect, inter: disnake.MessageInteraction):
-        if select.values[0] == "country":
-            emb = _country_help_embed(inter.guild)
-            await inter.response.send_message(embed=emb, view=CountryRegisterView(), ephemeral=True)
-
-
-class RegChannelSelect(disnake.ui.View):
-    @disnake.ui.channel_select(channel_types=[disnake.ChannelType.text])
-    async def select(self, select: disnake.ui.ChannelSelect, inter: disnake.MessageInteraction):
-        value = select.values[0]
-        if isinstance(value, disnake.abc.GuildChannel):
-            channel = value
-        else:
-            channel = inter.guild.get_channel(int(value))
-        emb = _reg_menu_embed(inter.guild)
-        await channel.send(embed=emb, view=RegistrationView())
-        await inter.response.edit_message(content="Сообщение отправлено.", view=None)
-
-
-@bot.command(name="reg-channel")
-async def reg_channel(ctx: commands.Context):
-    if not ctx.guild:
-        return await ctx.send(
-            embed=error_embed("Доступ запрещён", "Команда доступна только на сервере."),
-        )
-    if not ctx.author.guild_permissions.administrator:
-        return await ctx.send(
-            embed=error_embed("Доступ запрещён", "У вас нет прав на использование этой команды."),
-        )
-    view = RegChannelSelect()
-    await ctx.send("Выберите канал для отправки сообщения:", view=view)
-    
-# --- Свободные страны ---
-
-def build_free_countries_embeds(guild: disnake.Guild) -> list[disnake.Embed]:
-    """Формирует эмбеды о свободных странах по континентам."""
-    rows = countries_list_all(guild.id)
-    free_by_continent: dict[str, list[dict]] = {c: [] for c in ALL_CONTINENTS}
-    for r in rows:
-        if r.get("registered_user_id"):
-            continue
-        cont = r.get("continent") or "Другие"
-        free_by_continent.setdefault(cont, [])
-        free_by_continent[cont].append(r)
-
-    timestamp = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
-    embeds: list[disnake.Embed] = []
-    for continent, countries in free_by_continent.items():
-        lines = [
-            f"[{(c.get('code') or '').upper()}] | {c.get('flag') or ''} ・ {c.get('name') or ''}"
-            for c in countries
-        ]
-        value = "\n".join(lines) if lines else "—"
-        emb = disnake.Embed(title=":green_circle: Свободные страны", color=disnake.Color.green())
-        emb.add_field(name=continent, value=value, inline=False)
-        emb.set_footer(
-            text=f"Обновлено: {timestamp} | {guild.name}",
-            icon_url=getattr(guild.icon, "url", None),
-        )
-        embeds.append(emb)
-    return embeds
-
-
-def build_occupied_countries_embeds(guild: disnake.Guild) -> list[disnake.Embed]:
-    """Формирует эмбеды о занятых странах по континентам."""
-    rows = countries_list_all(guild.id)
-    busy_by_continent: dict[str, list[dict]] = {c: [] for c in ALL_CONTINENTS}
-    for r in rows:
-        uid = r.get("registered_user_id")
-        if not uid:
-            continue
-        cont = r.get("continent") or "Другие"
-        busy_by_continent.setdefault(cont, [])
-        busy_by_continent[cont].append(r)
-
-    timestamp = datetime.utcnow().strftime("%d.%m.%Y %H:%M UTC")
-    embeds: list[disnake.Embed] = []
-    for continent, countries in busy_by_continent.items():
-        lines = [
-            f"[{(c.get('code') or '').upper()}] | {c.get('flag') or ''} ・ {c.get('name') or ''} — <@{c.get('registered_user_id')}>"
-            for c in countries
-        ]
-        value = "\n".join(lines) if lines else "—"
-        emb = disnake.Embed(title=":red_circle: Занятые страны", color=disnake.Color.red())
-        emb.add_field(name=continent, value=value, inline=False)
-        emb.set_footer(
-            text=f"Обновлено: {timestamp} | {guild.name}",
-            icon_url=getattr(guild.icon, "url", None),
-        )
-        embeds.append(emb)
-    return embeds
-
-
-@bot.command(name="fc")
-async def free_countries_cmd(ctx: commands.Context):
-    """Отображает список свободных стран по континентам."""
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    embeds = build_free_countries_embeds(ctx.guild)
-    for emb in embeds:
-        await ctx.send(embed=emb)
-
-
-@bot.command(name="nfc")
-async def occupied_countries_cmd(ctx: commands.Context):
-    """Отображает список занятых стран по континентам."""
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    embeds = build_occupied_countries_embeds(ctx.guild)
-    for emb in embeds:
-        await ctx.send(embed=emb)
-
-async def send_free_countries_update():
-    channel = bot.get_channel(FREE_COUNTRIES_CHANNEL_ID)
-    if not channel:
-        return
-    guild = channel.guild
-    embeds = build_free_countries_embeds(guild)
-    # Получаем существующие сообщения бота
-    existing = [m async for m in channel.history(limit=50) if m.author == bot.user]
-    existing.reverse()  # от старых к новым
-
-    # Обновляем или отправляем новые сообщения
-    for i, emb in enumerate(embeds):
-        if i < len(existing):
-            with contextlib.suppress(Exception):
-                await existing[i].edit(embed=emb)
-        else:
-            await channel.send(embed=emb)
-
-    # Удаляем лишние сообщения
-    for m in existing[len(embeds):]:
-        with contextlib.suppress(Exception):
-            await m.delete()
-
-
-async def send_occupied_countries_update():
-    channel = bot.get_channel(OCCUPIED_COUNTRIES_CHANNEL_ID)
-    if not channel:
-        return
-    guild = channel.guild
-    embeds = build_occupied_countries_embeds(guild)
-    existing = [m async for m in channel.history(limit=50) if m.author == bot.user]
-    existing.reverse()
-
-    for i, emb in enumerate(embeds):
-        if i < len(existing):
-            with contextlib.suppress(Exception):
-                await existing[i].edit(embed=emb)
-        else:
-            await channel.send(embed=emb)
-
-    for m in existing[len(embeds):]:
-        with contextlib.suppress(Exception):
-            await m.delete()
-
-
-@tasks.loop(minutes=10)
-async def update_country_lists():
-    await send_free_countries_update()
-    await send_occupied_countries_update()
-
-
-@update_country_lists.before_loop
-async def before_update_country_lists():
-    await bot.wait_until_ready()
-
-
-class CountryProfileSelect(disnake.ui.StringSelect):
-    """Простое меню выбора страниц профиля страны."""
-
-    def __init__(self, target: disnake.Member, author_id: int):
-        options = [
-            disnake.SelectOption(
-                label="🪧 Профиль страны",
-                value="about",
-                description="Основная информация",
-                default=True,
-            ),
-            disnake.SelectOption(
-                label="🖇️ Государственное устройство",
-                value="gov",
-                description="Управление государством",
-            ),
-            disnake.SelectOption(
-                label="🎫 Лицензии",
-                value="licenses",
-                description="Информация о лицензиях",
-            ),
-            disnake.SelectOption(
-                label="🚀 Создание техники",
-                value="tech_create",
-                description="Заявка на технику",
-            ),
-        ]
-        super().__init__(
-            placeholder="Меню профиля",
-            options=options,
-            custom_id="country_profile_select",
-        )
-        self.target = target
-        self.author_id = author_id
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        if inter.user.id != self.author_id:
-            await inter.response.send_message(
-                "Вы не вызывали эту команду.", ephemeral=True
-            )
-            return
-        
-        if self.values:
-            val = self.values[0]
-            if val == "gov":
-                view = GovernmentView(self.target, self.author_id)
-                await inter.response.send_message(embed=view.build_embed(), view=view)
-                try:
-                    view.message = await inter.original_message()
-                except Exception:
-                    view.message = None
-                return
-            if val == "licenses":
-                view = CountryLicensesView(self.target, self.author_id)
-                await inter.response.send_message(embed=view.build_embed(), view=view)
-                try:
-                    view.message = await inter.original_message()
-                except Exception:
-                    view.message = None
-                return
-            if val == "tech_create":
-                view = CountryTechCreateView(self.target, self.author_id)
-                await inter.response.send_message(embed=view.build_embed(), view=view)
-                try:
-                    view.message = await inter.original_message()
-                except Exception:
-                    view.message = None
-                return
-        await inter.response.defer()
-
-
-class CountryProfileView(disnake.ui.View):
-    def __init__(self, target: disnake.Member, author_id: int):
-        super().__init__(timeout=120)
-        self.add_item(CountryProfileSelect(target, author_id))
-
-
-class GovernmentView(disnake.ui.View):
-    def __init__(self, target: disnake.Member, author_id: int):
-        super().__init__(timeout=120)
-        self.target = target
-        self.author_id = author_id
-        self.message: disnake.Message | None = None
-        self.country_code = country_get_registration_for_user(target.guild.id, target.id)
-        info = (
-            country_get_by_code_or_name(target.guild.id, self.country_code)
-            if self.country_code
-            else None
-        )
-        self.form = info.get("government_form") if info else None
-        self.ideology = info.get("ideology") if info else None
-        self.religion = info.get("religion") if info else None
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        if inter.user.id != self.author_id:
-            await inter.response.send_message(
-                "Эта панель доступна только вызвавшему команду.", ephemeral=True
-            )
-            return False
-        return True
-
-    def build_embed(self) -> disnake.Embed:
-        e = disnake.Embed(
-            title=":paperclips: Государственное устройство",
-            description=(
-                "Здесь вы можете изменить свой государственный строй.\n"
-                "При изменение обязательно обыгрывайте РП. Иначе вам будет выдано предупреждение от РП кураторов.\n"
-                "Совет: обсуждайте с РП куратором смену государственного строя.\n\n"
-                f"**:classical_building: Форма правления:**\n__{self.form or 'Не установлено.'}__\n\n"
-                f"**:dove: Идеология:**\n__{self.ideology or 'Не установлено.'}__\n\n"
-                f"**:orthodox_cross: Религия:**\n__{self.religion or 'Не установлено'}__"
-            ),
-            color=disnake.Color.blurple(),
-        )
-        e.set_author(
-            name=self.target.display_name,
-            icon_url=self.target.display_avatar.replace(size=64).url,
-        )
-        return e
-
-    @disnake.ui.button(label="Форма правления", style=disnake.ButtonStyle.primary)
-    async def form_btn(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        await inter.response.send_message(
-            "Выберите форму правления:", view=FormSelectView(self), ephemeral=True
-        )
-
-    @disnake.ui.button(label="Идеология", style=disnake.ButtonStyle.primary)
-    async def ideology_btn(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        await inter.response.send_message(
-            "Выберите идеологию:", view=IdeologySelectView(self), ephemeral=True
-        )
-
-    @disnake.ui.button(label="Религия", style=disnake.ButtonStyle.primary)
-    async def religion_btn(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        await inter.response.send_message(
-            "Выберите религию:", view=ReligionSelectView(self), ephemeral=True
-        )
-
-
-class CountryLicensesView(disnake.ui.View):
-    def __init__(self, target: disnake.Member, author_id: int):
-        super().__init__(timeout=120)
-        self.target = target
-        self.author_id = author_id
-        self.message: Optional[disnake.Message] = None
-        self.country_code = country_get_registration_for_user(target.guild.id, target.id)
-        self.info = (
-            country_get_by_code_or_name(target.guild.id, self.country_code)
-            if self.country_code
-            else None
-        )
-        self.has_license = bool(
-            self.info
-            and self.info.get("licenses")
-            and self.info["code"] in self.info["licenses"]
-        )
-
-        # Удаляем ненужные кнопки в зависимости от наличия лицензии
-        if self.has_license:
-            for child in list(self.children):
-                if getattr(child, "custom_id", "") == "country_create_license":
-                    self.remove_item(child)
-        else:
-            for child in list(self.children):
-                if getattr(child, "custom_id", "") == "country_my_license":
-                    self.remove_item(child)
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        if inter.user.id != self.author_id:
-            await inter.response.send_message("Эта панель доступна только вызвавшему команду.", ephemeral=True)
-            return False
-        return True
-
-    def build_embed(self) -> disnake.Embed:
-        desc_lines = [
-            "``` Лицензионное производство вооружения — это организация зарубежного производства, которая позволяет иностранному правительству или организации приобретать техническую информацию для производства всего или части оборудования или компонента, запатентованного в стране-экспортере.```\n",
-            "**Информация:**",
-            "*- Нажмите кнопку \"Список лицензий\" - для просмотра списка имеющихся у вас лицензий на производство техники.*",
-        ]
-        if self.has_license:
-            desc_lines.append(
-                "*- Нажмите кнопку \"Моя лицензия\" для просмотра информации и действий со своей лицензией.*"
-            )
-        else:
-            desc_lines.append(
-                "*- Нажмите кнопку \"Создать лицензию\" - для создания своей лицензии, вам понадобится заплатить за строительство военного завода по производству техники.*"
-            )
-        e = disnake.Embed(
-            title=":ticket: Лицензии",
-            description="\n".join(desc_lines),
-            color=disnake.Color.blurple(),
-        )
-        e.set_author(name=self.target.display_name, icon_url=self.target.display_avatar.url)
-        return e
-
-    @disnake.ui.button(
-        label="Создать лицензию",
-        style=disnake.ButtonStyle.success,
-        custom_id="country_create_license",
-    )
-    async def create_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not self.info:
-            return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
-        if self.has_license:
-            return await inter.response.send_message("У страны уже есть лицензия.", ephemeral=True)
-        view = LicenseCreateConfirmView(self)
-        await inter.response.edit_message(embed=view.build_embed(), view=view)
-
-    @disnake.ui.button(
-        label="Моя лицензия",
-        style=disnake.ButtonStyle.primary,
-        custom_id="country_my_license",
-    )
-    async def my_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not self.has_license:
-            return await inter.response.send_message("Лицензия не найдена.", ephemeral=True)
-        view = MyLicenseView(self)
-        await inter.response.edit_message(embed=view.build_embed(), view=view)
-
-    @disnake.ui.button(
-        label="Список лицензий",
-        style=disnake.ButtonStyle.secondary,
-        custom_id="country_license_list",
-    )
-    async def list_licenses(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not self.info:
-            return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
-        view = CountryLicenseListView(self)
-        await inter.response.edit_message(embed=view.build_embed(), view=view)
-
-
-class CountryLicenseListView(disnake.ui.View):
-    def __init__(self, parent: CountryLicensesView):
-        super().__init__(timeout=120)
-        self.parent = parent
-
-    def build_embed(self) -> disnake.Embed:
-        codes = country_get_licenses(
-            self.parent.target.guild.id, self.parent.info["code"]
-        )
-        lines = []
-        for code in codes:
-            info = country_get_by_code_or_name(self.parent.target.guild.id, code)
-            if info and info.get("licenses") and info["code"] in info["licenses"]:
-                lines.append(f"- {build_country_license_name(info)}")
-        e = disnake.Embed(
-            title="Список лицензий",
-            description="\n".join(lines) if lines else "Лицензии отсутствуют.",
-            color=disnake.Color.blurple(),
-        )
-        e.set_author(
-            name=self.parent.target.display_name,
-            icon_url=self.parent.target.display_avatar.url,
-        )
-        return e
-
-    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
-    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.edit_message(
-            embed=self.parent.build_embed(), view=self.parent
-        )
-
-
-class MyLicenseView(disnake.ui.View):
-    def __init__(self, parent: CountryLicensesView):
-        super().__init__(timeout=120)
-        self.parent = parent
-
-    def build_embed(self) -> disnake.Embed:
-        info = self.parent.info
-        e = disnake.Embed(
-            title=build_country_license_name(info),
-            color=disnake.Color.blurple(),
-        )
-        e.set_author(
-            name=self.parent.target.display_name,
-            icon_url=self.parent.target.display_avatar.url,
-        )
-        e.add_field(name="Страна:", value=info["name"], inline=False)
-        e.add_field(name="Пользователь:", value=self.parent.target.mention, inline=False)
-        hints = "\n".join(
-            [
-                "- Выберите \"Список операторов\" для просмотра стран, которые могут производить технику по вашей лицензии.",
-                "- Выберите \"Список техники\" для просмотра техники, которая доступна к производству по вашей лицензии;",
-                "- Выберите \"Назад к меню\" для возвращения назад",
-            ]
-        )
-        e.add_field(name="Подсказки", value=hints, inline=False)
-        return e
-
-    @disnake.ui.button(label="Список операторов", style=disnake.ButtonStyle.secondary)
-    async def operators(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        view = LicenseOperatorsView(self)
-        await inter.response.edit_message(embed=view.build_embed(), view=view)
-
-    @disnake.ui.button(label="Список техники", style=disnake.ButtonStyle.secondary)
-    async def items(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_message(
-            "Функция пока не реализована.", ephemeral=True
-        )
-
-    @disnake.ui.button(label="Назад к меню", style=disnake.ButtonStyle.danger)
-    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.edit_message(
-            embed=self.parent.build_embed(), view=self.parent
-        )
-
-
-class LicenseOperatorsView(disnake.ui.View):
-    def __init__(self, parent: MyLicenseView, page: int = 0):
-        super().__init__(timeout=120)
-        self.parent = parent
-        self.page = page
-        self.per_page = 5
-        rows = countries_list_all(parent.parent.target.guild.id)
-        self.holders = [
-            r
-            for r in rows
-            if parent.parent.info["code"] in (r.get("licenses") or [])
-        ]
-        if self.page <= 0:
-            self.prev_page.disabled = True
-        if (self.page + 1) * self.per_page >= len(self.holders):
-            self.next_page.disabled = True
-
-    def build_embed(self) -> disnake.Embed:
-        start = self.page * self.per_page
-        end = start + self.per_page
-        chunk = self.holders[start:end]
-        lines = []
-        for r in chunk:
-            user_id = country_get_occupant(
-                self.parent.parent.target.guild.id, r["code"]
-            )
-            mention = f"<@{user_id}>" if user_id else "—"
-            lines.append(f"- {r['name']} — {mention}")
-        e = disnake.Embed(
-            title="Список операторов",
-            description="\n".join(lines) if lines else "Страны-операторы отсутствуют.",
-            color=disnake.Color.blurple(),
-        )
-        e.set_author(
-            name=self.parent.parent.target.display_name,
-            icon_url=self.parent.parent.target.display_avatar.url,
-        )
-        return e
-
-    @disnake.ui.button(label="Назад к меню", style=disnake.ButtonStyle.secondary, row=1)
-    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.edit_message(
-            embed=self.parent.build_embed(), view=self.parent
-        )
-
-    @disnake.ui.button(label="Выдать лицензию", style=disnake.ButtonStyle.success, row=1)
-    async def issue(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_modal(LicenseIssueModal(self))
-
-    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
-    async def prev_page(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        view = LicenseOperatorsView(self.parent, self.page - 1)
-        await inter.response.edit_message(embed=view.build_embed(), view=view)
-
-    @disnake.ui.button(label="Вперёд", style=disnake.ButtonStyle.secondary)
-    async def next_page(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        view = LicenseOperatorsView(self.parent, self.page + 1)
-        await inter.response.edit_message(embed=view.build_embed(), view=view)
-
-
-class LicenseIssueModal(disnake.ui.Modal):
-    def __init__(self, parent_view: LicenseOperatorsView):
-        self.parent_view = parent_view
-        # store inputs as attributes so their values can be accessed in callback
-        self.country_name_input = disnake.ui.TextInput(
-            label="Название страны",
-            custom_id="country_name",
-            required=False,
-            max_length=100,
-        )
-        self.country_code_input = disnake.ui.TextInput(
-            label="Флаг или код",
-            custom_id="country_code",
-            required=False,
-            max_length=20,
-        )
-        components = [self.country_name_input, self.country_code_input]
-        super().__init__(title="Выдать лицензию", components=components)
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        # retrieve user-entered values from modal submission
-        name = inter.text_values.get("country_name", "").strip()
-        code_hint = inter.text_values.get("country_code", "").strip()
-        if not name and not code_hint:
-            await inter.response.send_message(
-                "Укажите название страны или её код.", ephemeral=True
-            )
-            return
-        query = code_hint or name
-        info = country_get_by_code_or_name(inter.guild.id, query)
-        if not info:
-            await inter.response.send_message("Страна не найдена.", ephemeral=True)
-            return
-        view = LicenseIssueView(self.parent_view, info)
-        await inter.response.edit_message(embed=view.build_embed(), view=view)
-        view.message = inter.message
-
-
-class LicenseIssueView(disnake.ui.View):
-    def __init__(self, parent_view: LicenseOperatorsView, target_info: dict):
-        super().__init__(timeout=120)
-        self.parent_view = parent_view
-        self.target_info = target_info
-        self.author_id = parent_view.parent.parent.target.id
-        self.permissions = {k: False for k, _ in LICENSE_PERMISSION_LIST}
-        self.message: Optional[disnake.Message] = None
-
-    def calculate_cost(self) -> int:
-        return sum(
-            LICENSE_PERMISSION_COSTS.get(k, 0)
-            for k, v in self.permissions.items()
-            if v
-        )
-
-    def build_embed(self) -> disnake.Embed:
-        lines = []
-        for idx, (key, label) in enumerate(LICENSE_PERMISSION_LIST, start=1):
-            status = "разрешено" if self.permissions.get(key) else "запрещено"
-            lines.append(f"{idx}. {label}: {status}")
-        cost = self.calculate_cost()
-        lines.append("")
-        lines.append("Подсказки")
-        lines.append("- Нажмите кнопку \"Управление разрешениями\" для настройки разрешений лицензии для данной страны.")
-        lines.append("- Стоимость выдачи лицензии зависит от выбранных вами разрешений.")
-        lines.append(f"С данными разрешениями цена составляет: {format_price(cost)}")
-        lines.append("")
-        lines.append(
-            f"Вы уверены, что хотите выдать лицензию с данными разрешениями стране \"{self.target_info['name']}\" и потратить \"{format_price(cost)}\""
-        )
-        e = disnake.Embed(
-            title="Выдача лицензии",
-            description="\n".join(lines),
-            color=disnake.Color.blurple(),
-        )
-        return e
-
-    def _update_message(self):
-        if self.message:
-            asyncio.create_task(self.message.edit(embed=self.build_embed(), view=self))
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        if inter.user.id != self.author_id:
-            await inter.response.send_message("Эта панель доступна только инициатору.", ephemeral=True)
-            return False
-        return True
-
-    @disnake.ui.button(label="Выдать", style=disnake.ButtonStyle.success)
-    async def issue(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        target_user_id = country_get_occupant(inter.guild.id, self.target_info["code"])
-        if not target_user_id:
-            await inter.response.send_message("Страна не имеет представителя.", ephemeral=True)
-            return
-        cost = self.calculate_cost()
-        owner_info = self.parent_view.parent.parent.info
-        lic_name = build_country_license_name(owner_info)
-        perm_lines = []
-        for key, label in LICENSE_PERMISSION_LIST:
-            status = "Разрешено" if self.permissions.get(key) else "Запрещено"
-            perm_lines.append(f"{label}: {status}")
-        offer_desc = [
-            f"Пользователь {inter.user.mention} предлагает выдать вам лицензию {lic_name} с следующими параметрами:",
-            *perm_lines,
-        ]
-        offer_embed = disnake.Embed(
-            title="Выдача лицензии",
-            description="\n".join(offer_desc),
-            color=disnake.Color.blurple(),
-        )
-        offer_view = LicenseOfferView(
-            inter.guild.id,
-            owner_info["code"],
-            self.target_info["code"],
-            inter.user.id,
-            cost,
-            self.permissions,
-        )
-        member = inter.guild.get_member(target_user_id)
-        await inter.channel.send(content=member.mention if member else None, embed=offer_embed, view=offer_view)
-        btn.disabled = True
-        self._update_message()
-        await inter.response.send_message("Предложение отправлено.", ephemeral=True)
-
-    @disnake.ui.button(label="Управление разрешениями", style=disnake.ButtonStyle.primary)
-    async def manage(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        view = LicensePermissionSelectView(self)
-        await inter.response.send_message("Выберите разрешения:", view=view, ephemeral=True)
-
-    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
-    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.edit_message(embed=self.parent_view.build_embed(), view=self.parent_view)
-
-
-class LicensePermissionSelect(disnake.ui.StringSelect):
-    def __init__(self, issue_view: LicenseIssueView):
-        options = [
-            disnake.SelectOption(
-                label=label,
-                value=key,
-                default=issue_view.permissions.get(key, False),
-            )
-            for key, label in LICENSE_PERMISSION_LIST
-        ]
-        super().__init__(
-            placeholder="Разрешённые категории",
-            options=options,
-            min_values=0,
-            max_values=len(options),
-        )
-        self.issue_view = issue_view
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        selected = set(self.values)
-        for key, _ in LICENSE_PERMISSION_LIST:
-            self.issue_view.permissions[key] = key in selected
-        self.issue_view._update_message()
-        await inter.response.edit_message(content="Разрешения обновлены.", view=None)
-
-
-class LicensePermissionSelectView(disnake.ui.View):
-    def __init__(self, issue_view: LicenseIssueView):
-        super().__init__(timeout=60)
-        self.add_item(LicensePermissionSelect(issue_view))
-
-
-class LicenseOfferView(disnake.ui.View):
-    def __init__(
-        self,
-        guild_id: int,
-        license_code: str,
-        country_code: str,
-        issuer_id: int,
-        cost: int,
-        permissions: dict,
-    ):
-        super().__init__(timeout=120)
-        self.guild_id = guild_id
-        self.license_code = license_code
-        self.country_code = country_code
-        self.issuer_id = issuer_id
-        self.cost = cost
-        self.permissions = permissions
-        self.target_user_id = country_get_occupant(guild_id, country_code)
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        if inter.user.id != self.target_user_id:
-            await inter.response.send_message("Это предложение предназначено не вам.", ephemeral=True)
-            return False
-        return True
-
-    @disnake.ui.button(label="Принять", style=disnake.ButtonStyle.success)
-    async def accept(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if get_balance(self.guild_id, self.issuer_id) < self.cost:
-            await inter.response.send_message("У отправителя недостаточно средств.", ephemeral=True)
-            return
-        update_balance(self.guild_id, self.issuer_id, -self.cost)
-        country_add_license(self.guild_id, self.country_code, self.license_code)
-        license_permissions_set(
-            self.guild_id, self.license_code, self.country_code, self.permissions
-        )
-        await inter.response.edit_message(content="Лицензия принята.", embed=None, view=None)
-
-    @disnake.ui.button(label="Отказаться", style=disnake.ButtonStyle.danger)
-    async def decline(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.edit_message(content="Вы отказались от лицензии.", embed=None, view=None)
-
-class LicenseCreateConfirmView(disnake.ui.View):
-    def __init__(self, parent: CountryLicensesView):
-        super().__init__(timeout=120)
-        self.parent = parent
-
-    def build_embed(self) -> disnake.Embed:
-        cost = LICENSE_FACTORY_COST
-        e = disnake.Embed(
-            title="Лицензии",
-            description=(
-                f"- Стоимость строительства военного завода по производству техники составляет: {format_price(cost)}\n"
-                "- Для подтверждения создания лицензии нажмите кнопку \"Подтвердить\"."
-            ),
-            color=disnake.Color.blurple(),
-        )
-        e.set_author(name=self.parent.target.display_name, icon_url=self.parent.target.display_avatar.url)
-        return e
-
-    @disnake.ui.button(label="Подтвердить", style=disnake.ButtonStyle.success)
-    async def confirm(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        info = self.parent.info
-        if not info:
-            return await inter.response.send_message("Информация о стране не найдена.", ephemeral=True)
-        cost = LICENSE_FACTORY_COST
-        balance = get_balance(inter.guild.id, self.parent.target.id)
-        if balance < cost:
-            return await inter.response.send_message(
-                f"Недостаточно средств. Нужно {format_price(cost)}.", ephemeral=True
-            )
-        name = build_country_license_name(info)
-        country_add_license(inter.guild.id, info["code"], info["code"])
-        update_balance(inter.guild.id, self.parent.target.id, -cost)
-        self.parent.info.setdefault("licenses", [])
-        if info["code"] not in self.parent.info["licenses"]:
-            self.parent.info["licenses"].append(info["code"])
-        await inter.response.edit_message(content="✅ Лицензия создана.", embed=None, view=None)
-
-    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
-    async def back(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.edit_message(embed=self.parent.build_embed(), view=self.parent)
-
-class FormSelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view: GovernmentView):
-        options = [
-            disnake.SelectOption(label="Парламентская республика", emoji="⚖️"),
-            disnake.SelectOption(label="Президентская республика", emoji="🤵"),
-            disnake.SelectOption(label="Смешанная республика", emoji="🔄"),
-            disnake.SelectOption(label="Теократическая республика", emoji="🛐"),
-            disnake.SelectOption(label="Парламентская монархия", emoji="🏛"),
-            disnake.SelectOption(label="Дуалистическая монархия", emoji="✏️"),
-            disnake.SelectOption(label="Абсолютная монархия", emoji="👑"),
-            disnake.SelectOption(label="Военная диктатура", emoji="🎖️"),
-        ]
-        super().__init__(placeholder="Форма правления", options=options)
-        self.parent_view = parent_view
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        label = self.values[0]
-        embed = disnake.Embed(
-            title=label, description="Будет добавлено позже", color=disnake.Color.blurple()
-        )
-        await inter.response.edit_message(
-            embed=embed, content=None, view=FormConfirmView(self.parent_view, label)
-        )
-
-
-class FormSelectView(disnake.ui.View):
-    def __init__(self, parent_view: GovernmentView):
-        super().__init__(timeout=60)
-        self.add_item(FormSelect(parent_view))
-
-
-class FormConfirmView(disnake.ui.View):
-    def __init__(self, parent_view: GovernmentView, label: str):
-        super().__init__(timeout=60)
-        self.parent_view = parent_view
-        self.label = label
-
-    @disnake.ui.button(label="Выбрать", style=disnake.ButtonStyle.success)
-    async def choose(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        self.parent_view.form = self.label
-        if self.parent_view.country_code:
-            country_update_system(
-                inter.guild.id, self.parent_view.country_code, form=self.label
-            )
-        if self.parent_view.message:
-            await self.parent_view.message.edit(
-                embed=self.parent_view.build_embed(), view=self.parent_view
-            )
-        await inter.response.edit_message(
-            content="Форма правления сохранена.", embed=None, view=None
-        )
-
-    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
-    async def back(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        await inter.response.edit_message(
-            content="Выберите форму правления:", embed=None, view=FormSelectView(self.parent_view)
-        )
-
-
-class IdeologySelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view: GovernmentView):
-        options = [
-            disnake.SelectOption(label="Консерватизм", emoji="📯"),
-            disnake.SelectOption(label="Монархизм", emoji="👑"),
-            disnake.SelectOption(label="Либерализм", emoji="🕊"),
-            disnake.SelectOption(label="Социализм", emoji="⚒️"),
-            disnake.SelectOption(label="Национализм", emoji="🦅"),
-            disnake.SelectOption(label="Технократия", emoji="⚙️"),
-            disnake.SelectOption(label="Фашизм", emoji="🛡"),
-            disnake.SelectOption(label="Нацизм", emoji="☠️"),
-            disnake.SelectOption(label="Социал-демократия", emoji="🌹"),
-            disnake.SelectOption(label="Исламизм", emoji="☪️"),
-            disnake.SelectOption(label="Анархизм", emoji="🏴"),
-            disnake.SelectOption(label="Коммунизм", emoji="🚩"),
-            disnake.SelectOption(label="Милитаризм", emoji="⚔️"),
-            disnake.SelectOption(label="Либертарианство", emoji="🦅"),
-        ]
-        super().__init__(placeholder="Идеология", options=options)
-        self.parent_view = parent_view
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        label = self.values[0]
-        embed = disnake.Embed(
-            title=label, description="Будет добавлено позже", color=disnake.Color.blurple()
-        )
-        await inter.response.edit_message(
-            embed=embed, content=None, view=IdeologyConfirmView(self.parent_view, label)
-        )
-
-
-class IdeologySelectView(disnake.ui.View):
-    def __init__(self, parent_view: GovernmentView):
-        super().__init__(timeout=60)
-        self.add_item(IdeologySelect(parent_view))
-
-
-class IdeologyConfirmView(disnake.ui.View):
-    def __init__(self, parent_view: GovernmentView, label: str):
-        super().__init__(timeout=60)
-        self.parent_view = parent_view
-        self.label = label
-
-    @disnake.ui.button(label="Выбрать", style=disnake.ButtonStyle.success)
-    async def choose(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        self.parent_view.ideology = self.label
-        if self.parent_view.country_code:
-            country_update_system(
-                inter.guild.id, self.parent_view.country_code, ideology=self.label
-            )
-        if self.parent_view.message:
-            await self.parent_view.message.edit(
-                embed=self.parent_view.build_embed(), view=self.parent_view
-            )
-        await inter.response.edit_message(
-            content="Идеология сохранена.", embed=None, view=None
-        )
-
-    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
-    async def back(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        await inter.response.edit_message(
-            content="Выберите идеологию:", embed=None, view=IdeologySelectView(self.parent_view)
-        )
-
-
-class ReligionSelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view: GovernmentView):
-        options = [
-            disnake.SelectOption(label="Православие", emoji="☦️"),
-            disnake.SelectOption(label="Католицизм", emoji="✝️"),
-            disnake.SelectOption(label="Протестантизм", emoji="✝️"),
-            disnake.SelectOption(label="Ислам", emoji="☪️"),
-            disnake.SelectOption(label="Буддизм", emoji="☸️"),
-            disnake.SelectOption(label="Индуизм", emoji="🕉"),
-            disnake.SelectOption(label="Иудаизм", emoji="✡️"),
-            disnake.SelectOption(label="Язычество", emoji="📿"),
-            disnake.SelectOption(label="Атеизм", emoji="🚫"),
-        ]
-        super().__init__(placeholder="Религия", options=options)
-        self.parent_view = parent_view
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        label = self.values[0]
-        embed = disnake.Embed(
-            title=label, description="Будет добавлено позже", color=disnake.Color.blurple()
-        )
-        await inter.response.edit_message(
-            embed=embed, content=None, view=ReligionConfirmView(self.parent_view, label)
-        )
-
-
-class ReligionSelectView(disnake.ui.View):
-    def __init__(self, parent_view: GovernmentView):
-        super().__init__(timeout=60)
-        self.add_item(ReligionSelect(parent_view))
-
-
-class ReligionConfirmView(disnake.ui.View):
-    def __init__(self, parent_view: GovernmentView, label: str):
-        super().__init__(timeout=60)
-        self.parent_view = parent_view
-        self.label = label
-
-    @disnake.ui.button(label="Выбрать", style=disnake.ButtonStyle.success)
-    async def choose(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        self.parent_view.religion = self.label
-        if self.parent_view.country_code:
-            country_update_system(
-                inter.guild.id, self.parent_view.country_code, religion=self.label
-            )
-        if self.parent_view.message:
-            await self.parent_view.message.edit(
-                embed=self.parent_view.build_embed(), view=self.parent_view
-            )
-        await inter.response.edit_message(
-            content="Религия сохранена.", embed=None, view=None
-        )
-
-    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary)
-    async def back(
-        self, btn: disnake.ui.Button, inter: disnake.MessageInteraction
-    ):
-        await inter.response.edit_message(
-            content="Выберите религию:", embed=None, view=ReligionSelectView(self.parent_view)
-        )
-
-
-@bot.command(name="моястрана")
-async def my_country_cmd(
-    ctx: commands.Context, member: Optional[disnake.Member] = None
-):
-    """Показывает профиль страны пользователя."""
-
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    if member and member != ctx.author and not ctx.author.guild_permissions.administrator:
-        return await ctx.send(
-            embed=error_embed(
-                "Доступ запрещён", "Просматривать чужой профиль может только администратор."
-            )
-        )
-
-    target = member or ctx.author
-    reg_info = country_get_registration_info(ctx.guild.id, target.id)
-    if not reg_info:
-        e = disnake.Embed(
-            description="Вы не зарегистрированы на страну.",
-            color=disnake.Color.red(),
-        )
-        e.set_author(name=target.display_name, icon_url=target.display_avatar.url)
-        e.set_thumbnail(url=target.display_avatar.replace(size=256).url)
-        return await ctx.send(embed=e)
-
-    code, reg_ts = reg_info
-    info = country_get_by_code_or_name(ctx.guild.id, code)
-    if not info:
-        return await ctx.send(embed=error_embed("Ошибка", "Данные страны не найдены."))
-
-    sea = (
-        _fmt_bool(bool(info.get("sea_access")))
-        if info.get("sea_access") is not None
-        else "—"
-    )
-
-    reg_dt = datetime.fromtimestamp(reg_ts)
-    news_count = 0
-    news_channel = ctx.guild.get_channel(NEWS_CHANNEL_ID)
-    if isinstance(news_channel, disnake.TextChannel):
-        async for msg in news_channel.history(limit=None, after=reg_dt):
-            if msg.author.id == target.id:
-                news_count += 1
-
-    e = disnake.Embed(title=":information_source: Информация:", color=disnake.Color.blurple())
-    e.set_author(name=target.display_name, icon_url=target.display_avatar.url)
-    e.set_thumbnail(url=target.display_avatar.replace(size=256).url)
-    e.add_field(name=":bust_in_silhouette: Пользователь:", value=target.mention, inline=False)
-    e.add_field(name=":camping: Страна:", value=info.get("name") or "—", inline=False)
-    e.add_field(name=":office_worker: Правитель:", value=info.get("ruler") or "—", inline=False)
-    e.add_field(name=":island: Континент:", value=info.get("continent") or "—", inline=False)
-    e.add_field(
-        name=":map: Территория:",
-        value=f"{format_number(info.get('territory_km2') or 0)} км²",
-        inline=False,
-    )
-    e.add_field(
-        name=":busts_in_silhouette: Население:",
-        value=f"{format_number(info.get('population') or 0)}",
-        inline=False,
-    )
-    e.add_field(name=":anchor: Выход в море:", value=sea, inline=False)
-    e.add_field(
-        name=":ticket: Зарегистрирован:", value=reg_dt.strftime("%d.%m.%Y %H:%M"), inline=False
-    )
-    e.add_field(name=":newspaper: Количество новостей:", value=str(news_count), inline=False)
-    await ctx.send(embed=e, view=CountryProfileView(target, ctx.author.id))
-
-
-@bot.command(name="liclist")
-async def liclist_cmd(ctx: commands.Context):
-    """Показать список существующих лицензий."""
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    rows = countries_list_all(ctx.guild.id)
-    lines = [f"- {build_country_license_name(r)}" for r in rows if r.get("licenses") and r["code"] in r["licenses"]]
-    e = disnake.Embed(
-        title="Список лицензий",
-        description="\n".join(lines) if lines else "Лицензии отсутствуют.",
-        color=disnake.Color.blurple(),
-    )
-    e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
-    await ctx.send(embed=e)
-
-
-@bot.command(name="lic-info")
-async def lic_info_cmd(ctx: commands.Context, *, license_name: str):
-    """Информация о конкретной лицензии."""
-    if not await ensure_allowed_ctx(ctx, ALLOWED_LIC_INFO):
-        return
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    info = country_get_by_code_or_name(ctx.guild.id, license_name)
-    if not info or not (info.get("licenses") and info["code"] in info["licenses"]):
-        return await ctx.send(embed=error_embed("Ошибка", "Лицензия не найдена."))
-    title = build_country_license_name(info)
-    owner_id = country_get_occupant(ctx.guild.id, info["code"])
-    owner = ctx.guild.get_member(owner_id) if owner_id else None
-    rows = countries_list_all(ctx.guild.id)
-    holders = [r["name"] for r in rows if info["code"] in (r.get("licenses") or [])]
-    e = disnake.Embed(title=title, color=disnake.Color.blurple())
-    e.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
-    e.add_field(name="Хозяин:", value=owner.mention if owner else "—", inline=False)
-    e.add_field(name="У кого имеется:", value="\n".join(holders) if holders else "—", inline=False)
-    await ctx.send(embed=e)
-
-
-@bot.command(name="delete-lic")
-async def delete_license_cmd(ctx: commands.Context, *, license_name: str):
-    if not await ensure_allowed_ctx(ctx, ALLOWED_DELETE_LIC):
-        return
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    info = country_get_by_code_or_name(ctx.guild.id, license_name)
-    if not info or not (info.get("licenses") and info["code"] in info["licenses"]):
-        return await ctx.send(embed=error_embed("Ошибка", "Лицензия не найдена."))
-    warn = disnake.Embed(
-        title="Удаление лицензии",
-        description=f"Вы уверены, что хотите удалить лицензию {info.get('flag') or ''} {info['name']} ({info['code']})?\nВведите в чат: удалить",
-        color=disnake.Color.red(),
-    )
-    prompt = await ctx.send(embed=warn)
-
-    def check(m: disnake.Message):
-        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
-
-    try:
-        msg = await ctx.bot.wait_for("message", check=check, timeout=30.0)
-        with contextlib.suppress(Exception):
-            await msg.delete()
-        if msg.content.strip().lower() != "удалить":
-            with contextlib.suppress(Exception):
-                await prompt.delete()
-            return await ctx.send("Удаление отменено.", delete_after=10)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(Exception):
-            await prompt.delete()
-        return await ctx.send("Время на подтверждение истекло.", delete_after=10)
-
-    country_remove_license(ctx.guild.id, info["code"])
-    done = disnake.Embed(
-        title="✅ Удалено",
-        description=f"Лицензия {info.get('flag') or ''} {info['name']} ({info['code']}) удалена.",
-        color=disnake.Color.green(),
-    )
-    await ctx.send(embed=done)
 
 
 def setup_shop_tables():
@@ -4073,8 +1659,7 @@ def setup_shop_tables():
     addcol("roles_granted_on_buy", "roles_granted_on_buy TEXT")
     addcol("roles_removed_on_buy", "roles_removed_on_buy TEXT")
     addcol("disallow_sell", "disallow_sell INTEGER DEFAULT 0")
-    addcol("license_role_id", "license_role_id INTEGER")
-    addcol("license_code", "license_code TEXT")
+    addcol("license_role_id", "license_role_id INTEGER")  # <<< НОВОЕ
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS item_shop_state (
@@ -4131,7 +1716,7 @@ def _item_row_to_dict(row) -> Optional[dict]:
         "roles_granted_on_buy": parse_roles_field(row[15]),
         "roles_removed_on_buy": parse_roles_field(row[16]),
         "disallow_sell": int(row[17] or 0),
-        "license_code": row[18] or None,
+        "license_role_id": None if row[18] is None else int(row[18]),
     }
 
 ROLE_ID_FINDER = re.compile(r"\d+")
@@ -4245,7 +1830,7 @@ def get_item_by_name(guild_id: int, name: str) -> Optional[dict]:
             id, guild_id, name, name_lower, price, sell_price, description,
             buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
             per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
         FROM items
         WHERE guild_id = ? AND name_lower = ?
     """, (guild_id, (name or "").strip().lower()))
@@ -4267,203 +1852,6 @@ def suggest_items(guild_id: int, query: str, limit: int = 5) -> list[str]:
     conn.close()
     return result
 
-
-def compute_tech_type_price(guild_id: int, items: list[tuple[str, int]]) -> int:
-    """Вычисляет суммарную стоимость типа техники по цене составляющих предметов."""
-    total = 0
-    for name, qty in items:
-        item = get_item_by_name(guild_id, name)
-        if item and isinstance(item.get("price"), int):
-            total += int(item["price"]) * int(qty)
-    return total
-
-
-def add_tech_type(guild_id: int, name: str, branch: str, items: list[tuple[str, int]]) -> int:
-    """Сохраняет тип техники в БД и возвращает его ID."""
-    price = compute_tech_type_price(guild_id, items)
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO tech_types (guild_id, name, branch, price, required_items)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (guild_id, name, branch, price, json.dumps(items) if items else None),
-    )
-    conn.commit()
-    type_id = c.lastrowid
-    conn.close()
-    return type_id
-
-
-def get_tech_types_by_branch(guild_id: int, branch: str) -> list[dict]:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT id, name, price FROM tech_types
-        WHERE guild_id = ? AND branch = ?
-        ORDER BY name
-        """,
-        (guild_id, branch),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return [{"id": r[0], "name": r[1], "price": r[2]} for r in rows]
-
-
-def get_tech_type_by_id(guild_id: int, type_id: int) -> Optional[dict]:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT id, name, branch, price, required_items
-        FROM tech_types
-        WHERE guild_id = ? AND id = ?
-        """,
-        (guild_id, type_id),
-    )
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        return None
-    return {
-        "id": row[0],
-        "name": row[1],
-        "branch": row[2],
-        "price": row[3],
-        "required_items": json.loads(row[4]) if row[4] else [],
-    }
-
-
-def get_all_tech_types(guild_id: int) -> list[dict]:
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        """
-        SELECT id, name, branch, price, required_items
-        FROM tech_types
-        WHERE guild_id = ?
-        ORDER BY id
-        """,
-        (guild_id,),
-    )
-    rows = c.fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        result.append({
-            "id": r[0],
-            "name": r[1],
-            "branch": r[2],
-            "price": r[3],
-            "required_items": json.loads(r[4]) if r[4] else [],
-        })
-    return result
-
-
-def add_shop_item_simple(guild_id: int, name: str, price: int, description: str = "") -> None:
-    """Добавляет предмет в магазин с минимальными параметрами."""
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO items (
-            guild_id, name, name_lower, price, sell_price, description,
-            buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
-            per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            guild_id,
-            name,
-            name.lower(),
-            price,
-            None,
-            description,
-            "currency",
-            None,
-            1,
-            None,
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-            0,
-            None,
-        ),
-    )
-    item_id = c.lastrowid
-    try:
-        c.execute(
-            """
-            INSERT OR IGNORE INTO item_shop_state (guild_id, item_id, current_stock, last_restock_ymd)
-            VALUES (?, ?, ?, ?)
-            """,
-            (guild_id, item_id, None, ymd_utc()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-def add_shop_item_from_tech(
-    guild_id: int,
-    name: str,
-    price: int,
-    description: str,
-    cost_items: list[dict] | None,
-    license_code: str | None,
-) -> None:
-    """Добавляет предмет техники в магазин с требованиями по ресурсам и лицензии."""
-    buy_type = "items" if cost_items else "currency"
-    conn = sqlite3.connect(get_db_path())
-    c = conn.cursor()
-    c.execute(
-        """
-        INSERT INTO items (
-            guild_id, name, name_lower, price, sell_price, description,
-            buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
-            per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            guild_id,
-            name,
-            name.lower(),
-            price,
-            None,
-            description,
-            buy_type,
-            json.dumps(cost_items) if cost_items else None,
-            1,
-            None,
-            0,
-            0,
-            None,
-            None,
-            None,
-            None,
-            1,
-            license_code,
-        ),
-    )
-    item_id = c.lastrowid
-    try:
-        c.execute(
-            """
-            INSERT OR IGNORE INTO item_shop_state (guild_id, item_id, current_stock, last_restock_ymd)
-            VALUES (?, ?, ?, ?)
-            """,
-            (guild_id, item_id, None, ymd_utc()),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
 def list_items_db(guild_id: int) -> list[dict]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
@@ -4472,7 +1860,7 @@ def list_items_db(guild_id: int) -> list[dict]:
             id, guild_id, name, name_lower, price, sell_price, description,
             buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
             per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
         FROM items
         WHERE guild_id = ?
         ORDER BY name_lower
@@ -4484,23 +1872,10 @@ def list_items_db(guild_id: int) -> list[dict]:
 def get_user_item_qty(guild_id: int, user_id: int, item_id: int) -> int:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        c.execute(
-            """
-            SELECT quantity FROM country_inventories
-            WHERE guild_id = ? AND code = ? AND item_id = ?
-            """,
-            (guild_id, code, item_id),
-        )
-    else:
-        c.execute(
-            """
-            SELECT quantity FROM inventories
-            WHERE guild_id = ? AND user_id = ? AND item_id = ?
-            """,
-            (guild_id, user_id, item_id),
-        )
+    c.execute("""
+        SELECT quantity FROM inventories
+        WHERE guild_id = ? AND user_id = ? AND item_id = ?
+    """, (guild_id, user_id, item_id))
     row = c.fetchone()
     conn.close()
     return int(row[0]) if row else 0
@@ -4510,27 +1885,12 @@ def add_items_to_user(guild_id: int, user_id: int, item_id: int, amount: int):
         return
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        c.execute(
-            """
-            INSERT INTO country_inventories (guild_id, code, item_id, quantity)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(guild_id, code, item_id) DO UPDATE SET
-                quantity = country_inventories.quantity + excluded.quantity
-            """,
-            (guild_id, code, item_id, amount),
-        )
-    else:
-        c.execute(
-            """
-            INSERT INTO inventories (guild_id, user_id, item_id, quantity)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(guild_id, user_id, item_id) DO UPDATE SET
-                quantity = inventories.quantity + excluded.quantity
-            """,
-            (guild_id, user_id, item_id, amount),
-        )
+    c.execute("""
+        INSERT INTO inventories (guild_id, user_id, item_id, quantity)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, user_id, item_id) DO UPDATE SET
+            quantity = inventories.quantity + excluded.quantity
+    """, (guild_id, user_id, item_id, amount))
     conn.commit()
     conn.close()
 
@@ -4539,61 +1899,24 @@ def remove_items_from_user(guild_id: int, user_id: int, item_id: int, amount: in
         return False
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        c.execute(
-            """
-            SELECT quantity FROM country_inventories
-            WHERE guild_id = ? AND code = ? AND item_id = ?
-            """,
-            (guild_id, code, item_id),
-        )
-        row = c.fetchone()
-        if not row or row[0] < amount:
-            conn.close()
-            return False
-        new_q = row[0] - amount
-        if new_q == 0:
-            c.execute(
-                "DELETE FROM country_inventories WHERE guild_id = ? AND code = ? AND item_id = ?",
-                (guild_id, code, item_id),
-            )
-        else:
-            c.execute(
-                """
-                UPDATE country_inventories
-                SET quantity = ?
-                WHERE guild_id = ? AND code = ? AND item_id = ?
-                """,
-                (new_q, guild_id, code, item_id),
-            )
+    c.execute("""
+        SELECT quantity FROM inventories
+        WHERE guild_id = ? AND user_id = ? AND item_id = ?
+    """, (guild_id, user_id, item_id))
+    row = c.fetchone()
+    if not row or row[0] < amount:
+        conn.close()
+        return False
+    new_q = row[0] - amount
+    if new_q == 0:
+        c.execute("DELETE FROM inventories WHERE guild_id = ? AND user_id = ? AND item_id = ?",
+                  (guild_id, user_id, item_id))
     else:
-        c.execute(
-            """
-            SELECT quantity FROM inventories
+        c.execute("""
+            UPDATE inventories
+            SET quantity = ?
             WHERE guild_id = ? AND user_id = ? AND item_id = ?
-            """,
-            (guild_id, user_id, item_id),
-        )
-        row = c.fetchone()
-        if not row or row[0] < amount:
-            conn.close()
-            return False
-        new_q = row[0] - amount
-        if new_q == 0:
-            c.execute(
-                "DELETE FROM inventories WHERE guild_id = ? AND user_id = ? AND item_id = ?",
-                (guild_id, user_id, item_id),
-            )
-        else:
-            c.execute(
-                """
-                UPDATE inventories
-                SET quantity = ?
-                WHERE guild_id = ? AND user_id = ? AND item_id = ?
-                """,
-                (new_q, guild_id, user_id, item_id),
-            )
+        """, (new_q, guild_id, user_id, item_id))
     conn.commit()
     conn.close()
     return True
@@ -4603,7 +1926,7 @@ ITEMS_COLUMNS = (
     "id, guild_id, name, name_lower, price, sell_price, description, "
     "buy_price_type, cost_items, is_listed, stock_total, restock_per_day, "
     "per_user_daily_limit, roles_required_buy, roles_required_sell, "
-    "roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code"
+    "roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id"
 )
 
 def search_items_by_name_or_id(guild_id: int, query: str) -> list[dict]:
@@ -4635,40 +1958,19 @@ def db_reset_user_inventory(guild_id: int, user_id: int) -> tuple[int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
     try:
-        if code:
-            c.execute(
-                """
-                SELECT COUNT(*), COALESCE(SUM(quantity), 0)
-                FROM country_inventories
-                WHERE guild_id = ? AND code = ?
-                """,
-                (guild_id, code),
-            )
-            row = c.fetchone()
-            distinct_items = int(row[0] or 0)
-            total_qty = int(row[1] or 0)
-            c.execute(
-                "DELETE FROM country_inventories WHERE guild_id = ? AND code = ?",
-                (guild_id, code),
-            )
-        else:
-            c.execute(
-                """
-                SELECT COUNT(*), COALESCE(SUM(quantity), 0)
-                FROM inventories
-                WHERE guild_id = ? AND user_id = ?
-                """,
-                (guild_id, user_id),
-            )
-            row = c.fetchone()
-            distinct_items = int(row[0] or 0)
-            total_qty = int(row[1] or 0)
-            c.execute(
-                "DELETE FROM inventories WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
+        # Считаем, чтобы вернуть статистику
+        c.execute("""
+            SELECT COUNT(*), COALESCE(SUM(quantity), 0)
+            FROM inventories
+            WHERE guild_id = ? AND user_id = ?
+        """, (guild_id, user_id))
+        row = c.fetchone()
+        distinct_items = int(row[0] or 0)
+        total_qty = int(row[1] or 0)
+
+        # Удаляем
+        c.execute("DELETE FROM inventories WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
         conn.commit()
         return distinct_items, total_qty
     finally:
@@ -4680,25 +1982,11 @@ def db_get_user_inventory_stats(guild_id: int, user_id: int) -> tuple[int, int]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        c.execute(
-            """
-            SELECT COUNT(*), COALESCE(SUM(quantity), 0)
-            FROM country_inventories
-            WHERE guild_id = ? AND code = ?
-            """,
-            (guild_id, code),
-        )
-    else:
-        c.execute(
-            """
-            SELECT COUNT(*), COALESCE(SUM(quantity), 0)
-            FROM inventories
-            WHERE guild_id = ? AND user_id = ?
-            """,
-            (guild_id, user_id),
-        )
+    c.execute("""
+        SELECT COUNT(*), COALESCE(SUM(quantity), 0)
+        FROM inventories
+        WHERE guild_id = ? AND user_id = ?
+    """, (guild_id, user_id))
     row = c.fetchone()
     conn.close()
     return int(row[0] or 0), int(row[1] or 0)
@@ -4990,30 +2278,26 @@ def parse_role_ids_from_text(guild: disnake.Guild, text: str) -> list[int]:
             ids.add(role.id)
     return sorted(ids)
 
-def license_block_embed(item: dict, guild: disnake.Guild) -> disnake.Embed:
-    lic_code = item.get("license_code")
-    if lic_code:
-        info = country_get_by_code_or_name(guild.id, lic_code)
-        name = build_country_license_name(info) if info else lic_code
-    else:
-        name = "—"
+def license_block_embed(item: dict, role: Optional[disnake.Role]) -> disnake.Embed:
+    mention = role.mention if role else (f"<@&{int(item['license_role_id'])}>" if item.get('license_role_id') else "—")
     return disnake.Embed(
         title="Покупка недоступна",
         description=(
-            f"Для покупки предмета «{item.get('name', 'Без названия')}» требуется лицензия {name}.\n"
+            f"Для покупки предмета «{item.get('name', 'Без названия')}» требуется лицензия {mention}.\n"
             f"Для получения лицензии обращайтесь к её владельцу."
         ),
         color=disnake.Color.orange()
     )
 
 def user_has_item_license(member: disnake.Member, item: dict) -> bool:
-    lic_code = item.get("license_code")
-    if not lic_code:
+    lic_id = item.get("license_role_id")
+    if not lic_id:
         return True
-    user_code = country_get_registration_for_user(member.guild.id, member.id)
-    if not user_code:
-        return False
-    return country_has_license(member.guild.id, user_code, lic_code)
+    try:
+        lic_id = int(lic_id)
+    except Exception:
+        return True  # некорректная настройка, не блокируем
+    return any(r.id == lic_id for r in member.roles)
 
 class ShopView(disnake.ui.View):
     def __init__(self, ctx: commands.Context, items: list[dict]):
@@ -5233,7 +2517,7 @@ class ItemDraft:
     roles_required_sell: list[int] = field(default_factory=list)
     roles_granted_on_buy: list[int] = field(default_factory=list)
     roles_removed_on_buy: list[int] = field(default_factory=list)
-    license_code: Optional[str] = None
+    license_role_id: Optional[int] = None   # <<< НОВОЕ
 
 
 # Предполагается, что у тебя есть эти функции для работы с БД
@@ -5257,10 +2541,91 @@ def search_items_by_name_or_id(guild_id: int, query: str) -> list[dict]:
 
     # Если по ID не нашли или query не число, ищем по имени
     search_query = f"%{query.lower()}%"
-    c.execute("SELECT * FROM items WHERE guild_id = ? AND name_lower LIKE ? LIMIT 10", (guild_id, search_query))
+    c.execute(
+        "SELECT * FROM items WHERE guild_id = ? AND name_lower LIKE ? ORDER BY name_lower",
+        (guild_id, search_query)
+    )
     items = [dict(row) for row in c.fetchall()]
     conn.close()
     return items
+
+
+class ItemSelectionView(disnake.ui.View):
+    def __init__(self, ctx: commands.Context, items: list[dict], timeout: int = 60, per_page: int = 10):
+        super().__init__(timeout=timeout)
+        self.ctx = ctx
+        self.items = items
+        self.per_page = max(1, per_page)
+        self.page = 0
+        self.max_page = max(0, (len(items) - 1) // self.per_page) if items else 0
+        self.author_id = ctx.author.id if ctx.author else None
+        self.message: Optional[disnake.Message] = None
+        self._sync_buttons_state()
+
+    async def interaction_check(self, interaction: disnake.MessageInteraction) -> bool:
+        if self.author_id and interaction.user.id != self.author_id:
+            await interaction.response.send_message("Управлять списком может только инициатор.", ephemeral=True)
+            return False
+        return True
+
+    def _sync_buttons_state(self):
+        for child in self.children:
+            if isinstance(child, disnake.ui.Button):
+                if child.custom_id == "item_select_prev":
+                    child.disabled = self.page <= 0
+                elif child.custom_id == "item_select_next":
+                    child.disabled = self.page >= self.max_page
+
+    def _page_slice(self) -> list[tuple[int, dict]]:
+        start = self.page * self.per_page
+        end = start + self.per_page
+        return list(enumerate(self.items[start:end], start=start + 1))
+
+    def build_embed(self) -> disnake.Embed:
+        description_lines = [
+            "Найдено несколько предметов. Введите номер нужного вам предмета в чат.",
+            "Используйте кнопки ниже, чтобы листать совпадения.",
+            ""
+        ]
+
+        page_items = self._page_slice()
+        if not page_items:
+            description_lines.append("Совпадения отсутствуют.")
+        else:
+            for index, item in page_items:
+                description_lines.append(f"**{index}.** {item['name']} (ID: {item['id']})")
+
+        embed = disnake.Embed(
+            title="Выберите предмет",
+            description="\n".join(description_lines),
+            color=disnake.Color.orange()
+        )
+
+        total_pages = self.max_page + 1 if self.items else 1
+        embed.set_footer(text=f"Страница {self.page + 1} из {total_pages} • У вас есть ограниченное время на ответ.")
+        return embed
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            if isinstance(child, disnake.ui.Button):
+                child.disabled = True
+        if self.message:
+            with contextlib.suppress(disnake.HTTPException):
+                await self.message.edit(view=self)
+
+    @disnake.ui.button(label="Назад", style=disnake.ButtonStyle.secondary, custom_id="item_select_prev")
+    async def prev_page(self, button: disnake.ui.Button, interaction: disnake.MessageInteraction):
+        if self.page > 0:
+            self.page -= 1
+        self._sync_buttons_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @disnake.ui.button(label="Вперёд", style=disnake.ButtonStyle.secondary, custom_id="item_select_next")
+    async def next_page(self, button: disnake.ui.Button, interaction: disnake.MessageInteraction):
+        if self.page < self.max_page:
+            self.page += 1
+        self._sync_buttons_state()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 async def resolve_item_by_user_input(
     ctx: commands.Context,
@@ -5280,17 +2645,10 @@ async def resolve_item_by_user_input(
     if len(results) == 1:
         return results[0], None
 
-    description = "Найдено несколько предметов. Введите номер нужного вам предмета в чат.\n\n"
-    for i, item in enumerate(results, 1):
-        description += f"**{i}.** {item['name']} (ID: {item['id']})\n"
-    
-    choice_embed = disnake.Embed(
-        title="Выберите предмет",
-        description=description,
-        color=disnake.Color.orange()
-    ).set_footer(text=f"У вас есть {timeout} секунд на ответ.")
-
-    prompt_message = await ctx.channel.send(embed=choice_embed)
+    view = ItemSelectionView(ctx, results, timeout=timeout)
+    choice_embed = view.build_embed()
+    prompt_message = await ctx.channel.send(embed=choice_embed, view=view)
+    view.message = prompt_message
 
     def check(m: disnake.Message):
         return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
@@ -5305,6 +2663,7 @@ async def resolve_item_by_user_input(
                 selected_item = results[int(msg.content) - 1]
                 with contextlib.suppress(disnake.HTTPException):
                     await prompt_message.delete()
+                view.stop()
                 return selected_item, None
             else:
                 await ctx.channel.send(f"Неверный ввод. Пожалуйста, введите число от 1 до {len(results)}.", delete_after=10)
@@ -5312,10 +2671,12 @@ async def resolve_item_by_user_input(
         except asyncio.TimeoutError:
             with contextlib.suppress(disnake.HTTPException):
                 await prompt_message.delete()
+            view.stop()
             return None, "Время на выбор истекло."
 
     with contextlib.suppress(disnake.HTTPException):
         await prompt_message.delete()
+    view.stop()
     return None, "Вы исчерпали все попытки выбора."
 
 # ЗАМЕНИТЬ ВЕСЬ БЛОК ОТ class BasicInfoModal ДО КОНЦА class CreateItemWizard
@@ -5662,7 +3023,7 @@ class CreateItemWizard(disnake.ui.View):
             self.draft.editing_item_id = int(item_to_edit.get("id")) if item_to_edit.get("id") is not None else None
             self.draft.name = item_to_edit.get("name") or ""
             self.draft.description = item_to_edit.get("description") or ""
-            self.draft.license_code = item_to_edit.get("license_code")
+            self.draft.license_role_id = item_to_edit.get("license_role_id")
             
             # Продажа (!sell)
             self.draft.disallow_sell = int(item_to_edit.get("disallow_sell") or 0)
@@ -5838,11 +3199,7 @@ class CreateItemWizard(disnake.ui.View):
             ),
             inline=False
         )
-        if self.draft.license_code:
-            info = country_get_by_code_or_name(self.ctx.guild.id, self.draft.license_code)
-            lic_txt = build_country_license_name(info) if info else self.draft.license_code
-        else:
-            lic_txt = "—"
+        lic_txt = f"<@&{self.draft.license_role_id}>" if self.draft.license_role_id else "—"
         e.add_field(
             name="🔖 Лицензия",
             value=f"Лицензия: {lic_txt}",
@@ -5890,34 +3247,24 @@ class CreateItemWizard(disnake.ui.View):
 
     @disnake.ui.button(label="Лицензия", style=disnake.ButtonStyle.secondary, custom_id="step_license", row=3)
     async def _open_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        async def on_pick(code: Optional[str], i: disnake.MessageInteraction):
-            self.draft.license_code = code
+        async def on_pick(role_id: int, i: disnake.MessageInteraction):
+            self.draft.license_role_id = role_id
             if self.message:
                 with contextlib.suppress(Exception):
                     await self.message.edit(embed=self.build_embed(), view=self)
 
-        cur_name = None
-        if self.draft.license_code:
-            info = country_get_by_code_or_name(self.ctx.guild.id, self.draft.license_code)
-            if info:
-                cur_name = build_country_license_name(info)
         emb = build_license_pick_embed(
             invoker=inter.user,
-            title="Выбор лицензии для предмета",
-            current_license=cur_name,
+            title="Выбор роли лицензии для предмета",
+            current_role_id=self.draft.license_role_id
         )
 
-        picker = CountryLicensePickView(self.ctx, on_pick=on_pick, current_code=self.draft.license_code)
+        picker = LicenseRolePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
         try:
-            if inter.response.is_done():
-                await inter.followup.send(embed=emb, view=picker, ephemeral=True)
-            else:
-                await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
-        except disnake.errors.NotFound:
-            await inter.channel.send(
-                f"{inter.user.mention}, не удалось открыть меню выбора лицензии. Попробуйте снова.")
-            return
-        
+            await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
+        except Exception:
+            await inter.followup.send(embed=emb, view=picker, ephemeral=True)
+
         with contextlib.suppress(Exception):
             picker.message = await inter.original_message()
 
@@ -5936,6 +3283,8 @@ class CreateItemWizard(disnake.ui.View):
         exists = get_item_by_name(inter.guild.id, self.draft.name)
         if exists and exists['id'] != self.draft.editing_item_id:
             return await inter.response.send_message(embed=error_embed("Ошибка", "Предмет с таким именем уже существует."), ephemeral=True)
+
+        await inter.response.defer()
 
         # --- Подготовка данных для БД + строгая валидация чисел ---
         MAX_SQL_INT = 9_223_372_036_854_775_807
@@ -5970,6 +3319,7 @@ class CreateItemWizard(disnake.ui.View):
 
             is_listed_val = safe_int(1 if self.draft.is_listed else 0, name="Публикация", min_v=0, max_v=1)
             disallow_sell_val = safe_int(self.draft.disallow_sell, name="Запрет продажи", min_v=0, max_v=1)
+            license_role_id_val = safe_optional_int(self.draft.license_role_id, name="Лицензия (роль)", min_v=0)
 
             editing_item_id_val = None
             if self.draft.editing_item_id:
@@ -5988,9 +3338,9 @@ class CreateItemWizard(disnake.ui.View):
                     UPDATE items SET
                         name = ?, name_lower = ?, price = ?, sell_price = ?, description = ?,
                         buy_price_type = ?, cost_items = ?, is_listed = ?, stock_total = ?, 
-                        restock_per_day = ?, per_user_daily_limit = ?, roles_required_buy = ?,
-                        roles_required_sell = ?, roles_granted_on_buy = ?, roles_removed_on_buy = ?,
-                        disallow_sell = ?, license_code = ?
+                        restock_per_day = ?, per_user_daily_limit = ?, roles_required_buy = ?, 
+                        roles_required_sell = ?, roles_granted_on_buy = ?, roles_removed_on_buy = ?, 
+                        disallow_sell = ?, license_role_id = ?
                     WHERE id = ? AND guild_id = ?
                 """, (
                     self.draft.name, self.draft.name.lower(), price_val, sell_price_val, self.draft.description,
@@ -6000,7 +3350,7 @@ class CreateItemWizard(disnake.ui.View):
                     csv_from_ids(self.draft.roles_required_sell) or None,
                     csv_from_ids(self.draft.roles_granted_on_buy) or None,
                     csv_from_ids(self.draft.roles_removed_on_buy) or None,
-                    disallow_sell_val, self.draft.license_code,
+                    disallow_sell_val, license_role_id_val,
                     editing_item_id_val, guild_id_val
                 ))
                 conn.commit()
@@ -6015,7 +3365,7 @@ class CreateItemWizard(disnake.ui.View):
                         guild_id, name, name_lower, price, sell_price, description,
                         buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
                         per_user_daily_limit, roles_required_buy, roles_required_sell,
-                        roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_code
+                        roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     guild_id_val, self.draft.name, self.draft.name.lower(), price_val, sell_price_val, self.draft.description,
@@ -6025,7 +3375,7 @@ class CreateItemWizard(disnake.ui.View):
                     csv_from_ids(self.draft.roles_required_sell) or None,
                     csv_from_ids(self.draft.roles_granted_on_buy) or None,
                     csv_from_ids(self.draft.roles_removed_on_buy) or None,
-                    disallow_sell_val, self.draft.license_code
+                    disallow_sell_val, license_role_id_val
                 ))
                 conn.commit()
                 item_id = c.lastrowid
@@ -6039,7 +3389,8 @@ class CreateItemWizard(disnake.ui.View):
         except sqlite3.IntegrityError as e:
             conn.close()
             print(f"Ошибка сохранения предмета: {e}")
-            return await inter.response.send_message(embed=error_embed("Ошибка", "Предмет с таким именем уже существует (ошибка базы данных)."), ephemeral=True)
+            await inter.followup.send(embed=error_embed("Ошибка", "Предмет с таким именем уже существует (ошибка базы данных)."), ephemeral=True)
+            return
         finally:
             conn.close()
 
@@ -6077,7 +3428,7 @@ class CreateItemWizard(disnake.ui.View):
             color=disnake.Color.green()
         )
         done.set_author(name=self.ctx.author.display_name, icon_url=self.ctx.author.display_avatar.url)
-        await inter.response.edit_message(embed=done, view=None)
+        await inter.edit_original_message(embed=done, view=None)
 
 
     @disnake.ui.string_select(
@@ -6177,466 +3528,6 @@ ADMIN_COMMANDS_WITH_FLAGS: list[tuple[str, str, str]] = [
     ("!reset-inventory", "очистить инвентарь", "ALLOWED_RESET_INVENTORY"),
     ("!apanel", "панель администрации (изменено)", "ALLOWED_APANEL"),
 ]
-
-
-class PermissionCategorySelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view: "PermissionsMenuView"):
-        self.parent_view = parent_view
-        options = []
-        for category in parent_view.manager.categories.keys():
-            options.append(
-                disnake.SelectOption(
-                    label=category,
-                    value=category,
-                    default=category == parent_view.category,
-                )
-            )
-        super().__init__(
-            placeholder="Категория команд",
-            options=options[:25],
-            min_values=1,
-            max_values=1,
-            row=0,
-        )
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        if not await self.parent_view.check_interaction(inter):
-            return
-        new_category = self.values[0]
-        self.parent_view.set_category(new_category)
-        await self.parent_view.refresh(inter)
-
-
-class PermissionFlagSelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view: "PermissionsMenuView"):
-        self.parent_view = parent_view
-        options = self.parent_view.build_flag_options()
-        super().__init__(
-            placeholder="Команда",
-            options=options,
-            min_values=1,
-            max_values=1,
-            row=1,
-        )
-
-    def refresh_options(self):
-        self.options = self.parent_view.build_flag_options()
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        if not await self.parent_view.check_interaction(inter):
-            return
-        self.parent_view.set_flag(self.values[0])
-        await self.parent_view.refresh(inter)
-
-
-class PermissionRolePicker(disnake.ui.RoleSelect):
-    def __init__(self, parent_view: "PermissionsMenuView"):
-        self.parent_view = parent_view
-        super().__init__(
-            placeholder="Выберите роли",
-            min_values=1,
-            max_values=10,
-        )
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        if not await self.parent_view.check_interaction(inter):
-            return
-        added: list[str] = []
-        for role in self.values:
-            self.parent_view.manager.add_entry(inter.guild.id, self.parent_view.flag, "role", role.id)
-            added.append(role.mention)
-        await self.parent_view.apply_changes(inter, f"Добавлены роли: {', '.join(added)}")
-
-
-class PermissionMemberPicker(disnake.ui.UserSelect):
-    def __init__(self, parent_view: "PermissionsMenuView"):
-        self.parent_view = parent_view
-        super().__init__(
-            placeholder="Выберите участников",
-            min_values=1,
-            max_values=10,
-        )
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        if not await self.parent_view.check_interaction(inter):
-            return
-        added: list[str] = []
-        for member in self.values:
-            self.parent_view.manager.add_entry(inter.guild.id, self.parent_view.flag, "user", member.id)
-            added.append(member.mention)
-        await self.parent_view.apply_changes(inter, f"Добавлены участники: {', '.join(added)}")
-
-
-class PermissionRemoveSelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view: "PermissionsMenuView", options: list[disnake.SelectOption]):
-        self.parent_view = parent_view
-        capped_options = options[:25]
-        super().__init__(
-            placeholder="Выберите записи для удаления",
-            options=capped_options,
-            min_values=1,
-            max_values=len(capped_options),
-        )
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        if not await self.parent_view.check_interaction(inter):
-            return
-        removed_labels: list[str] = []
-        for value in self.values:
-            t_type, t_id = value.split(":", 1)
-            target_id = int(t_id)
-            self.parent_view.manager.remove_entry(inter.guild.id, self.parent_view.flag, t_type, target_id)
-            if t_type == "role":
-                role = inter.guild.get_role(target_id)
-                removed_labels.append(role.mention if role else f"Роль ID {target_id}")
-            elif t_type == "user":
-                removed_labels.append(f"<@{target_id}>")
-            elif t_type == "admin":
-                removed_labels.append("Администраторы")
-            elif t_type == "everyone":
-                removed_labels.append("Все участники")
-        await self.parent_view.apply_changes(inter, f"Удалено: {', '.join(removed_labels)}")
-
-
-class PermissionRoleSelectView(disnake.ui.View):
-    def __init__(self, parent_view: "PermissionsMenuView"):
-        super().__init__(timeout=120)
-        self.parent_view = parent_view
-        self.add_item(PermissionRolePicker(parent_view))
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        return await self.parent_view.check_interaction(inter)
-
-
-class PermissionMemberSelectView(disnake.ui.View):
-    def __init__(self, parent_view: "PermissionsMenuView"):
-        super().__init__(timeout=120)
-        self.parent_view = parent_view
-        self.add_item(PermissionMemberPicker(parent_view))
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        return await self.parent_view.check_interaction(inter)
-
-
-class PermissionRemoveView(disnake.ui.View):
-    def __init__(self, parent_view: "PermissionsMenuView", options: list[disnake.SelectOption]):
-        super().__init__(timeout=120)
-        self.parent_view = parent_view
-        self.add_item(PermissionRemoveSelect(parent_view, options))
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        return await self.parent_view.check_interaction(inter)
-
-
-class PermissionSearchModal(disnake.ui.Modal):
-    def __init__(self, parent_view: "PermissionsMenuView"):
-        self.parent_view = parent_view
-        components = [
-            disnake.ui.TextInput(
-                label="Что ищем?",
-                custom_id="query",
-                placeholder="Введите название, команду или часть описания",
-                min_length=2,
-                max_length=60,
-            )
-        ]
-        super().__init__(title="Поиск команды", components=components)
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        if not await self.parent_view.check_interaction(inter):
-            return
-        query = inter.text_values.get("query", "").strip()
-        result = self.parent_view.manager.search_flag(query)
-        if result is None:
-            await inter.response.send_message("Команда не найдена. Попробуйте другой запрос.", ephemeral=True)
-            return
-        category, flag = result
-        self.parent_view.focus_flag(flag)
-        await self.parent_view.refresh()
-        await inter.response.send_message(
-            f"Переключено на **{flag.label}** (категория {category}).",
-        )
-
-
-class PermissionsMenuView(disnake.ui.View):
-    def __init__(self, ctx: commands.Context):
-        super().__init__(timeout=420)
-        self.ctx = ctx
-        self.guild = ctx.guild
-        self.message: disnake.Message | None = None
-        self.manager = permission_manager
-        categories = list(self.manager.categories.keys())
-        self.category = categories[0] if categories else ""
-        flags = self.manager.categories.get(self.category, [])
-        self.flag = flags[0] if flags else next(iter(self.manager.flags.values()))
-
-        self.category_select = PermissionCategorySelect(self)
-        self.flag_select = PermissionFlagSelect(self)
-        self.add_item(self.category_select)
-        self.add_item(self.flag_select)
-        self.refresh_controls()
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        return await self.check_interaction(inter)
-
-    async def check_interaction(self, inter: disnake.MessageInteraction) -> bool:
-        if inter.user.id == self.ctx.author.id:
-            return True
-        perms = getattr(inter.user, "guild_permissions", None)
-        if perms and (perms.administrator or perms.manage_guild):
-            return True
-        await inter.response.send_message("⛔ Это меню доступно только администраторам сервера.", ephemeral=True)
-        return False
-
-    def build_flag_options(self) -> list[disnake.SelectOption]:
-        options: list[disnake.SelectOption] = []
-        for flag in self.manager.categories.get(self.category, []):
-            description = flag.description[:95] if flag.description else None
-            options.append(
-                disnake.SelectOption(
-                    label=flag.label[:100],
-                    value=flag.name,
-                    description=description,
-                    emoji=flag.emoji,
-                    default=flag is self.flag,
-                )
-            )
-        return options[:25]
-
-    def set_category(self, category: str):
-        if category not in self.manager.categories:
-            return
-        self.category = category
-        flags = self.manager.categories.get(category, [])
-        if flags:
-            self.flag = flags[0]
-        self.update_category_defaults()
-        self.flag_select.refresh_options()
-        self.refresh_controls()
-
-    def set_flag(self, flag_name: str):
-        flag = self.manager.flags.get(flag_name)
-        if flag is None:
-            return
-        self.flag = flag
-        self.refresh_controls()
-
-    def focus_flag(self, flag: PermissionFlag):
-        category = self.manager.get_category_for_flag(flag)
-        if category:
-            self.category = category
-        self.update_category_defaults()
-        self.flag = flag
-        self.refresh_controls()
-
-    def update_category_defaults(self):
-        for option in self.category_select.options:
-            option.default = option.value == self.category
-
-    def refresh_controls(self):
-        snapshot = self.manager.get_snapshot(self.guild.id, self.flag)
-        toggle_button = self.toggle_everyone  # type: ignore[attr-defined]
-        toggle_button.label = "Открыть для всех" if not snapshot.allow_everyone else "Запретить @everyone"
-        toggle_button.style = (
-            disnake.ButtonStyle.success if not snapshot.allow_everyone else disnake.ButtonStyle.danger
-        )
-        remove_button = self.remove_access  # type: ignore[attr-defined]
-        remove_button.disabled = not snapshot.has_custom_overrides
-        reset_button = self.reset_to_defaults  # type: ignore[attr-defined]
-        reset_button.disabled = not snapshot.has_custom_overrides
-        self.update_category_defaults()
-        self.flag_select.refresh_options()
-
-    def build_embed(self) -> disnake.Embed:
-        snapshot = self.manager.get_snapshot(self.guild.id, self.flag)
-        if snapshot.allow_everyone:
-            color = disnake.Color.green()
-        elif snapshot.has_custom_overrides:
-            color = disnake.Color.gold()
-        else:
-            color = disnake.Color.red()
-        title_prefix = f"{self.flag.emoji} " if self.flag.emoji else ""
-        embed = disnake.Embed(
-            title=f"{title_prefix}Настройка прав — {self.flag.label}",
-            description=self.flag.description or "",
-            color=color,
-        )
-        lines = snapshot.build_lines(self.guild)
-        embed.add_field(name="Текущий доступ", value="\n".join(lines), inline=False)
-        mode = "Пользовательские правила" if snapshot.has_custom_overrides else "Настройки по умолчанию"
-        embed.add_field(name="Режим", value=mode, inline=False)
-        embed.set_footer(text=f"Категория: {self.category} • Настройки действуют только на этом сервере")
-        return embed
-
-    def build_overview_embed(self) -> disnake.Embed:
-        embed = disnake.Embed(
-            title="Обзор прав бота",
-            description="🟢 — открыт для всех\n🟡 — есть свои правила\n🔴 — используются значения по умолчанию",
-            color=disnake.Color.dark_teal(),
-        )
-        embed.set_footer(text=f"Сервер: {self.guild.name}")
-
-        for category, flags in self.manager.categories.items():
-            if not flags:
-                continue
-            lines: list[str] = []
-            for flag in flags:
-                snapshot = self.manager.get_snapshot(self.guild.id, flag)
-                if snapshot.allow_everyone:
-                    status = "🟢"
-                elif snapshot.has_custom_overrides:
-                    status = "🟡"
-                else:
-                    status = "🔴"
-                lines.append(f"{status} {flag.label}")
-            if not lines:
-                continue
-            current_block = ""
-            block_index = 0
-            for line in lines:
-                candidate = f"{current_block}{line}\n"
-                if len(candidate) > 1018:
-                    title = category if block_index == 0 else f"{category} (продолжение {block_index})"
-                    embed.add_field(name=title, value=current_block.strip(), inline=False)
-                    current_block = f"{line}\n"
-                    block_index += 1
-                else:
-                    current_block = candidate
-            if current_block:
-                title = category if block_index == 0 else f"{category} (продолжение {block_index})"
-                embed.add_field(name=title, value=current_block.strip(), inline=False)
-
-        if not embed.fields:
-            embed.description += "\nНет зарегистрированных команд."
-        return embed
-
-    async def refresh(self, inter: disnake.MessageInteraction | None = None):
-        self.refresh_controls()
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
-        if inter and not inter.response.is_done():
-            await inter.response.edit_message(embed=self.build_embed(), view=self)
-
-    async def apply_changes(self, inter: disnake.MessageInteraction, summary: str):
-        self.refresh_controls()
-        if self.message:
-            await self.message.edit(embed=self.build_embed(), view=self)
-        await inter.response.edit_message(content=summary, view=None)
-
-    async def on_timeout(self):
-        for item in self.children:
-            if hasattr(item, "disabled"):
-                item.disabled = True
-        if self.message:
-            with contextlib.suppress(Exception):
-                await self.message.edit(view=self)
-
-    @disnake.ui.button(label="Добавить роль", style=disnake.ButtonStyle.success, row=2)
-    async def add_role_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        view = PermissionRoleSelectView(self)
-        await inter.response.send_message("Выберите роли, которым дать доступ", view=view, ephemeral=True)
-
-    @disnake.ui.button(label="Добавить участника", style=disnake.ButtonStyle.success, row=2)
-    async def add_user_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        view = PermissionMemberSelectView(self)
-        await inter.response.send_message("Выберите участников, которым дать доступ", view=view, ephemeral=True)
-
-    @disnake.ui.button(label="Поиск команды", emoji="🔍", style=disnake.ButtonStyle.secondary, row=2)
-    async def search_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        await inter.response.send_modal(PermissionSearchModal(self))
-
-    @disnake.ui.button(label="Добавить админов", style=disnake.ButtonStyle.primary, row=2)
-    async def add_admins_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        self.manager.add_entry(inter.guild.id, self.flag, "admin", 0)
-        await inter.response.send_message("Администраторы получили доступ.", ephemeral=True)
-        await self.refresh()
-
-    @disnake.ui.button(label="Открыть для всех", style=disnake.ButtonStyle.success, row=3)
-    async def toggle_everyone(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        snapshot = self.manager.get_snapshot(inter.guild.id, self.flag)
-        new_value = not snapshot.allow_everyone
-        self.manager.set_everyone(inter.guild.id, self.flag, new_value)
-        await inter.response.send_message(
-            "Доступ открыт для всех." if new_value else "Доступ для всех отключён.",
-            ephemeral=True,
-        )
-        await self.refresh()
-
-    @disnake.ui.button(label="Удалить доступ", style=disnake.ButtonStyle.danger, row=3)
-    async def remove_access(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        entries = self.manager.list_custom_entries(inter.guild.id, self.flag)
-        options: list[disnake.SelectOption] = []
-        for entry in entries:
-            if entry.target_type == "everyone":
-                label = "Все участники"
-            elif entry.target_type == "admin":
-                label = "Администраторы"
-            elif entry.target_type == "role":
-                role = inter.guild.get_role(entry.target_id)
-                label = role.name if role else f"Роль ID {entry.target_id}"
-            else:
-                member = inter.guild.get_member(entry.target_id)
-                label = member.display_name if member else f"Пользователь ID {entry.target_id}"
-            options.append(disnake.SelectOption(label=label[:100], value=f"{entry.target_type}:{entry.target_id}"))
-        if not options:
-            await inter.response.send_message("Нет пользовательских записей для удаления.", ephemeral=True)
-            return
-        view = PermissionRemoveView(self, options)
-        await inter.response.send_message("Выберите, что удалить", view=view, ephemeral=True)
-
-    @disnake.ui.button(label="Сбросить", style=disnake.ButtonStyle.secondary, row=3)
-    async def reset_to_defaults(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        self.manager.clear_flag(inter.guild.id, self.flag)
-        await inter.response.send_message("Настройки возвращены к стандартным.", ephemeral=True)
-        await self.refresh()
-
-    @disnake.ui.button(label="Обзор настроек", emoji="📊", style=disnake.ButtonStyle.secondary, row=4)
-    async def overview_button(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        embed = self.build_overview_embed()
-        await inter.response.send_message(embed=embed, ephemeral=True)
-
-    @disnake.ui.button(label="Закрыть", style=disnake.ButtonStyle.danger, row=4)
-    async def close_menu(self, button: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not await self.check_interaction(inter):
-            return
-        for item in self.children:
-            if isinstance(item, (disnake.ui.Button, disnake.ui.SelectBase)):
-                item.disabled = True
-        if self.message:
-            await self.message.edit(view=self)
-        await inter.response.send_message("Меню закрыто.", ephemeral=True)
-
-
-@bot.command(name="perms")
-async def perms_command(ctx: commands.Context):
-    """Открывает меню управления правами бота."""
-    if not ctx.guild:
-        await ctx.send(embed=error_embed("Недоступно", "Команда работает только на сервере."))
-        return
-    author_perms = ctx.author.guild_permissions
-    if not (author_perms.administrator or author_perms.manage_guild):
-        await ctx.send(embed=error_embed("Недостаточно прав", "Нужны права администратора или управления сервером."))
-        return
-
-    view = PermissionsMenuView(ctx)
-    message = await ctx.send(embed=view.build_embed(), view=view)
-    view.message = message
 
 
 async def _ensure_allowed_silent(ctx: commands.Context, allowed_flag) -> bool:
@@ -6938,28 +3829,10 @@ async def delete_item_cmd(ctx: commands.Context, *, item_query: str = ""):
     c = conn.cursor()
 
     # Сколько всего экземпляров предмета у пользователей и у скольких пользователей он есть
-    c.execute(
-        "SELECT COALESCE(SUM(quantity), 0) FROM inventories WHERE guild_id = ? AND item_id = ?",
-        (guild_id, item_id),
-    )
-    total_qty_user = int(c.fetchone()[0] or 0)
-    c.execute(
-        "SELECT COALESCE(SUM(quantity), 0) FROM country_inventories WHERE guild_id = ? AND item_id = ?",
-        (guild_id, item_id),
-    )
-    total_qty_country = int(c.fetchone()[0] or 0)
-    total_qty = total_qty_user + total_qty_country
-    c.execute(
-        "SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id = ? AND quantity > 0",
-        (guild_id, item_id),
-    )
-    holders_user = int(c.fetchone()[0] or 0)
-    c.execute(
-        "SELECT COUNT(*) FROM country_inventories WHERE guild_id = ? AND item_id = ? AND quantity > 0",
-        (guild_id, item_id),
-    )
-    holders_country = int(c.fetchone()[0] or 0)
-    holders = holders_user + holders_country
+    c.execute("SELECT COALESCE(SUM(quantity), 0) FROM inventories WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
+    total_qty = int(c.fetchone()[0] or 0)
+    c.execute("SELECT COUNT(*) FROM inventories WHERE guild_id = ? AND item_id = ? AND quantity > 0", (guild_id, item_id))
+    holders = int(c.fetchone()[0] or 0)
 
     # Сколько ссылок на этот предмет в стоимостях других предметов
     c.execute("SELECT id, name, cost_items FROM items WHERE guild_id = ? AND id != ?", (guild_id, item_id))
@@ -7036,7 +3909,6 @@ async def delete_item_cmd(ctx: commands.Context, *, item_query: str = ""):
 
         # Удаляем записи инвентарей
         c.execute("DELETE FROM inventories WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
-        c.execute("DELETE FROM country_inventories WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
         # Удаляем состояние склада и дневные лимиты
         c.execute("DELETE FROM item_shop_state WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
         c.execute("DELETE FROM item_user_daily WHERE guild_id = ? AND item_id = ?", (guild_id, item_id))
@@ -7131,12 +4003,17 @@ async def buy_cmd(ctx: commands.Context, *, raw: str):
         ))
 
     # ——— НОВОЕ: проверка лицензии предмета ———
-    lic_code = item.get("license_code")
-    if lic_code:
-        user_code = country_get_registration_for_user(ctx.guild.id, ctx.author.id)
-        if not user_code or not country_has_license(ctx.guild.id, user_code, lic_code):
-            info = country_get_by_code_or_name(ctx.guild.id, lic_code)
-            mention = build_country_license_name(info) if info else lic_code
+    lic_id = item.get("license_role_id")
+    if lic_id is not None:
+        try:
+            lic_id = int(lic_id)
+        except Exception:
+            lic_id = None
+    if lic_id:
+        has_license = any(r.id == lic_id for r in ctx.author.roles)
+        if not has_license:
+            lic_role = ctx.guild.get_role(lic_id)
+            mention = lic_role.mention if lic_role else f"<@&{lic_id}>"
             emb = disnake.Embed(
                 title="Покупка недоступна",
                 description=(
@@ -7383,15 +4260,15 @@ async def item_info_cmd(ctx: commands.Context, *, name: str):
     
     lic_val = "—"
     try:
+        # item тут — нормализованный dict, но license может отсутствовать; достанем сырцом
         conn = sqlite3.connect(get_db_path())
         c = conn.cursor()
-        c.execute("SELECT license_code FROM items WHERE guild_id=? AND id=?", (ctx.guild.id, item["id"]))
+        c.execute("SELECT license_role_id FROM items WHERE guild_id=? AND id=?", (ctx.guild.id, item["id"]))
         row = c.fetchone()
         conn.close()
         if row and row[0]:
-            info = country_get_by_code_or_name(ctx.guild.id, row[0])
-            lic_val = build_country_license_name(info) if info else row[0]
-    except Exception:
+            lic_val = f"<@&{int(row[0])}>"
+    except:
         pass
     embed.add_field(name="🔖 Лицензия", value=lic_val, inline=True)
 
@@ -7409,31 +4286,14 @@ def list_user_inventory_db(guild_id: int, user_id: int) -> list[dict]:
     """
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        c.execute(
-            """
-            SELECT i.id, i.name, i.description, inv.quantity
-            FROM country_inventories AS inv
-            JOIN items AS i
-              ON i.id = inv.item_id AND i.guild_id = inv.guild_id
-            WHERE inv.guild_id = ? AND inv.code = ?
-            ORDER BY i.name_lower
-            """,
-            (guild_id, code),
-        )
-    else:
-        c.execute(
-            """
-            SELECT i.id, i.name, i.description, inv.quantity
-            FROM inventories AS inv
-            JOIN items AS i
-              ON i.id = inv.item_id AND i.guild_id = inv.guild_id
-            WHERE inv.guild_id = ? AND inv.user_id = ?
-            ORDER BY i.name_lower
-            """,
-            (guild_id, user_id),
-        )
+    c.execute("""
+        SELECT i.id, i.name, i.description, inv.quantity
+        FROM inventories AS inv
+        JOIN items AS i
+          ON i.id = inv.item_id AND i.guild_id = inv.guild_id
+        WHERE inv.guild_id = ? AND inv.user_id = ?
+        ORDER BY i.name_lower
+    """, (guild_id, user_id))
     rows = c.fetchall()
     conn.close()
     return [
@@ -7442,8 +4302,7 @@ def list_user_inventory_db(guild_id: int, user_id: int) -> list[dict]:
             "name": r[1],
             "description": r[2] or "",
             "quantity": int(r[3]),
-        }
-        for r in rows
+        } for r in rows
     ]
 
 
@@ -8328,7 +5187,12 @@ def _ri_params_to_lines(guild: disnake.Guild, ri: dict) -> list[str]:
     typ = "💰 Деньги" if ri["income_type"] == "money" else "📦 Предметы"
     lines.append(f"Тип: {typ}")
     if ri["income_type"] == "money":
-        lines.append(f"Сумма за сбор: {format_number(int(ri['money_amount'] or 0))} {MONEY_EMOJI}")
+        income = money_income_display(
+            ri.get("money_amount", 0),
+            is_percent=ri.get("money_is_percent", False),
+            is_debit=ri.get("money_is_debit", False)
+        )
+        lines.append(f"Денежный доход: {income}")
     else:
         lines.append(f"Предметы: {_ri_items_to_str(guild, ri.get('items') or [])}")
     lines.append(f"Кулдаун: {format_seconds(int(ri['cooldown_seconds'] or 0))}")
@@ -8354,9 +5218,22 @@ def _ri_diff_lines(guild: disnake.Guild, before: Optional[dict], after: Optional
         a = "💰 Деньги" if after.get("income_type") == "money" else "📦 Предметы"
         lines.append(f"Тип: {b} → {a}")
 
-    # Сумма (имеет смысл для money)
-    if int(before.get("money_amount") or 0) != int(after.get("money_amount") or 0):
-        lines.append(f"Сумма: {format_number(int(before.get('money_amount') or 0))} → {format_number(int(after.get('money_amount') or 0))}")
+    # Сумма/процент
+    b_money = before.get("income_type") == "money"
+    a_money = after.get("income_type") == "money"
+    if b_money or a_money:
+        b_text = money_income_display(
+            before.get("money_amount", 0),
+            is_percent=before.get("money_is_percent", False),
+            is_debit=before.get("money_is_debit", False)
+        ) if b_money else "—"
+        a_text = money_income_display(
+            after.get("money_amount", 0),
+            is_percent=after.get("money_is_percent", False),
+            is_debit=after.get("money_is_debit", False)
+        ) if a_money else "—"
+        if b_text != a_text:
+            lines.append(f"Денежный доход: {b_text} → {a_text}")
 
     # Предметы (строковое представление)
     b_items = _ri_items_to_str(guild, before.get("items") or [])
@@ -8701,7 +5578,16 @@ def db_get_role_incomes(guild_id: int) -> list[dict]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
     c.execute("""
-        SELECT role_id, income_type, money_amount, items_json, cooldown_seconds, created_by, created_ts
+        SELECT
+            role_id,
+            income_type,
+            money_amount,
+            money_is_percent,
+            money_is_debit,
+            items_json,
+            cooldown_seconds,
+            created_by,
+            created_ts
         FROM role_incomes
         WHERE guild_id = ?
         ORDER BY role_id
@@ -8711,9 +5597,9 @@ def db_get_role_incomes(guild_id: int) -> list[dict]:
     result = []
     for r in rows:
         items = []
-        if r[1] == "items" and r[3]:
+        if r[1] == "items" and r[5]:
             try:
-                parsed = json.loads(r[3])
+                parsed = json.loads(r[5])
                 if isinstance(parsed, list):
                     items = [{"item_id": int(x["item_id"]), "qty": int(x["qty"])} for x in parsed]
             except Exception:
@@ -8722,10 +5608,12 @@ def db_get_role_incomes(guild_id: int) -> list[dict]:
             "role_id": int(r[0]),
             "income_type": r[1],
             "money_amount": int(r[2] or 0),
+            "money_is_percent": bool(int(r[3] or 0)),
+            "money_is_debit": bool(int(r[4] or 0)),
             "items": items,
-            "cooldown_seconds": int(r[4] or 0),
-            "created_by": int(r[5]) if r[5] is not None else None,
-            "created_ts": int(r[6]) if r[6] is not None else None,
+            "cooldown_seconds": int(r[6] or 0),
+            "created_by": int(r[7]) if r[7] is not None else None,
+            "created_ts": int(r[8]) if r[8] is not None else None,
         })
     return result
 
@@ -8733,7 +5621,15 @@ def db_get_role_income(guild_id: int, role_id: int) -> Optional[dict]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
     c.execute("""
-        SELECT income_type, money_amount, items_json, cooldown_seconds, created_by, created_ts
+        SELECT
+            income_type,
+            money_amount,
+            money_is_percent,
+            money_is_debit,
+            items_json,
+            cooldown_seconds,
+            created_by,
+            created_ts
         FROM role_incomes
         WHERE guild_id = ? AND role_id = ?
     """, (guild_id, role_id))
@@ -8742,9 +5638,9 @@ def db_get_role_income(guild_id: int, role_id: int) -> Optional[dict]:
     if not row:
         return None
     items = []
-    if row[0] == "items" and row[2]:
+    if row[0] == "items" and row[4]:
         try:
-            parsed = json.loads(row[2])
+            parsed = json.loads(row[4])
             if isinstance(parsed, list):
                 items = [{"item_id": int(x["item_id"]), "qty": int(x["qty"])} for x in parsed]
         except Exception:
@@ -8753,10 +5649,12 @@ def db_get_role_income(guild_id: int, role_id: int) -> Optional[dict]:
         "role_id": role_id,
         "income_type": row[0],
         "money_amount": int(row[1] or 0),
+        "money_is_percent": bool(int(row[2] or 0)),
+        "money_is_debit": bool(int(row[3] or 0)),
         "items": items,
-        "cooldown_seconds": int(row[3] or 0),
-        "created_by": int(row[4]) if row[4] is not None else None,
-        "created_ts": int(row[5]) if row[5] is not None else None,
+        "cooldown_seconds": int(row[5] or 0),
+        "created_by": int(row[6]) if row[6] is not None else None,
+        "created_ts": int(row[7]) if row[7] is not None else None,
     }
 
 def db_upsert_role_income(
@@ -8766,7 +5664,10 @@ def db_upsert_role_income(
     money_amount: int,
     items: list[dict],
     cooldown_seconds: int,
-    created_by: Optional[int] = None
+    created_by: Optional[int] = None,
+    *,
+    money_is_percent: bool = False,
+    money_is_debit: bool = False
 ):
     import time as _time
     conn = sqlite3.connect(get_db_path())
@@ -8776,16 +5677,40 @@ def db_upsert_role_income(
 
     # сохраняем created_by/created_ts только если они ещё не установлены (COALESCE)
     c.execute(f"""
-        INSERT INTO role_incomes (guild_id, role_id, income_type, money_amount, items_json, cooldown_seconds, created_by, created_ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO role_incomes (
+            guild_id,
+            role_id,
+            income_type,
+            money_amount,
+            money_is_percent,
+            money_is_debit,
+            items_json,
+            cooldown_seconds,
+            created_by,
+            created_ts
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(guild_id, role_id) DO UPDATE SET
             income_type = excluded.income_type,
             money_amount = excluded.money_amount,
+            money_is_percent = excluded.money_is_percent,
+            money_is_debit = excluded.money_is_debit,
             items_json = excluded.items_json,
             cooldown_seconds = excluded.cooldown_seconds,
             created_by = COALESCE(role_incomes.created_by, excluded.created_by),
             created_ts = COALESCE(role_incomes.created_ts, excluded.created_ts)
-    """, (guild_id, role_id, income_type, int(money_amount or 0), items_json, int(cooldown_seconds or 0), created_by, created_ts))
+    """, (
+        guild_id,
+        role_id,
+        income_type,
+        int(money_amount or 0),
+        1 if money_is_percent else 0,
+        1 if money_is_debit else 0,
+        items_json,
+        int(cooldown_seconds or 0),
+        created_by,
+        created_ts
+    ))
     conn.commit()
     conn.close()
 
@@ -8794,7 +5719,6 @@ def db_delete_role_income(guild_id: int, role_id: int):
     c = conn.cursor()
     c.execute("DELETE FROM role_incomes WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
     c.execute("DELETE FROM role_income_cooldowns WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
-    c.execute("DELETE FROM country_role_income_cooldowns WHERE guild_id = ? AND role_id = ?", (guild_id, role_id))
     conn.commit()
     conn.close()
 
@@ -8823,17 +5747,10 @@ def db_set_role_income_log_channel(guild_id: int, channel_id: Optional[int]):
 def db_get_ri_last_ts(guild_id: int, role_id: int, user_id: int) -> Optional[int]:
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        c.execute("""
-            SELECT last_ts FROM country_role_income_cooldowns
-            WHERE guild_id = ? AND role_id = ? AND code = ?
-        """, (guild_id, role_id, code))
-    else:
-        c.execute("""
-            SELECT last_ts FROM role_income_cooldowns
-            WHERE guild_id = ? AND role_id = ? AND user_id = ?
-        """, (guild_id, role_id, user_id))
+    c.execute("""
+        SELECT last_ts FROM role_income_cooldowns
+        WHERE guild_id = ? AND role_id = ? AND user_id = ?
+    """, (guild_id, role_id, user_id))
     row = c.fetchone()
     conn.close()
     return int(row[0]) if row else None
@@ -8841,21 +5758,12 @@ def db_get_ri_last_ts(guild_id: int, role_id: int, user_id: int) -> Optional[int
 def db_set_ri_last_ts(guild_id: int, role_id: int, user_id: int, ts: int):
     conn = sqlite3.connect(get_db_path())
     c = conn.cursor()
-    code = country_get_registration_for_user(guild_id, user_id)
-    if code:
-        c.execute("""
-            INSERT INTO country_role_income_cooldowns (guild_id, role_id, code, last_ts)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(guild_id, role_id, code) DO UPDATE SET
-                last_ts = excluded.last_ts
-        """, (guild_id, role_id, code, ts))
-    else:
-        c.execute("""
-            INSERT INTO role_income_cooldowns (guild_id, role_id, user_id, last_ts)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(guild_id, role_id, user_id) DO UPDATE SET
-                last_ts = excluded.last_ts
-        """, (guild_id, role_id, user_id, ts))
+    c.execute("""
+        INSERT INTO role_income_cooldowns (guild_id, role_id, user_id, last_ts)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(guild_id, role_id, user_id) DO UPDATE SET
+            last_ts = excluded.last_ts
+    """, (guild_id, role_id, user_id, ts))
     conn.commit()
     conn.close()
 
@@ -8910,13 +5818,99 @@ def parse_duration_to_seconds(text: str) -> Optional[int]:
         return None
     return total
 
+# ===== Вспомогательные функции для денежных доходов ролей =====
+
+def parse_money_income_input(text: str) -> tuple[int, bool, bool]:
+    """Парсит ввод суммы/процента для доходной роли.
+
+    Возвращает кортеж ``(value, is_percent, is_debit)`` где ``value`` — абсолютное
+    значение (целое > 0). ``is_percent`` указывает, что введено значение в процентах,
+    ``is_debit`` — что это списание (знак «-»).
+    """
+
+    raw = (text or "").strip().lower().replace(" ", "")
+    if not raw:
+        raise ValueError("Введите сумму или процент.")
+
+    is_percent = raw.endswith("%")
+    if is_percent:
+        raw = raw[:-1]
+    if not raw:
+        raise ValueError("Введите значение перед знаком процента.")
+
+    sign = 1
+    if raw[0] in "+-":
+        sign = -1 if raw[0] == "-" else 1
+        raw = raw[1:]
+    if not raw:
+        raise ValueError("Введите числовое значение.")
+
+    if is_percent:
+        value = safe_int(raw, name="Процент", min_v=0, max_v=1000)
+    else:
+        value = safe_int(raw, name="Сумма", min_v=0)
+
+    if value <= 0:
+        raise ValueError("Значение должно быть больше 0.")
+
+    return value, is_percent, sign < 0
+
+
+def money_income_input_value(amount: int, *, is_percent: bool, is_debit: bool) -> str:
+    """Строка для подстановки в модалку (редактирование)."""
+    amount = abs(int(amount or 0))
+    if amount <= 0:
+        return ""
+    sign = "-" if is_debit else ""
+    suffix = "%" if is_percent else ""
+    return f"{sign}{amount}{suffix}"
+
+
+def money_income_display(
+    amount: int,
+    *,
+    is_percent: bool,
+    is_debit: bool,
+    include_suffix: bool = True,
+    percent_suffix: str = "от денежного дохода сбора"
+) -> str:
+    """Форматирует настройки денежного дохода для отображения."""
+
+    amount = abs(int(amount or 0))
+    if is_percent:
+        if amount == 0:
+            base = "0%"
+        else:
+            sign = "-" if is_debit else "+"
+            base = f"{sign}{amount}%"
+        return f"{base} {percent_suffix}" if include_suffix else base
+
+    if amount == 0:
+        return f"0 {MONEY_EMOJI}"
+    sign = "-" if is_debit else "+"
+    return f"{sign}{format_number(abs(amount))} {MONEY_EMOJI}"
+
+
+def signed_money_amount(amount: int) -> str:
+    """Возвращает сумму с явным знаком для фактического начисления/списания."""
+
+    if amount == 0:
+        return f"0 {MONEY_EMOJI}"
+    sign = "+" if amount > 0 else "-"
+    return f"{sign}{format_number(abs(amount))} {MONEY_EMOJI}"
+
 # ===== Вью и модалки для настройки доходных ролей =====
 
 def _fmt_income_line(guild: disnake.Guild, ri: dict) -> str:
     role_mention = f"<@&{ri['role_id']}>"
     cd = format_seconds(ri['cooldown_seconds'])
     if ri["income_type"] == "money":
-        return f"{role_mention} • Тип: 💰 Деньги • Доход: {format_number(ri['money_amount'])} {MONEY_EMOJI} • Кулдаун: {cd}"
+        income = money_income_display(
+            ri.get("money_amount", 0),
+            is_percent=ri.get("money_is_percent", False),
+            is_debit=ri.get("money_is_debit", False)
+        )
+        return f"{role_mention} • Тип: 💰 Деньги • Доход: {income} • Кулдаун: {cd}"
     else:
         id2name = items_id_to_name_map(guild)
         if not ri["items"]:
@@ -8998,16 +5992,31 @@ def build_role_income_embed(guild: disnake.Guild, invoker: disnake.Member) -> di
     return e
 
 class RIMoneyModal(disnake.ui.Modal):
-    def __init__(self, view_ref, mode: str, role_id: int, money_amount: int = 0, cooldown_seconds: int = 86400):
+    def __init__(
+        self,
+        view_ref,
+        mode: str,
+        role_id: int,
+        money_amount: int = 0,
+        cooldown_seconds: int = 86400,
+        *,
+        money_is_percent: bool = False,
+        money_is_debit: bool = False
+    ):
         # mode: 'add' | 'edit'
+        amount_value = money_income_input_value(
+            money_amount,
+            is_percent=money_is_percent,
+            is_debit=money_is_debit
+        )
         components = [
             disnake.ui.TextInput(
-                label="Сумма за один !collect (целое > 0)",
+                label="Сумма/процент за один !collect",
                 custom_id="ri_money",
                 style=disnake.TextInputStyle.short,
                 required=True,
-                placeholder="например: 250",
-                value=str(money_amount) if money_amount > 0 else ""
+                placeholder="Например: 250, -1000, 15%, -10%",
+                value=amount_value
             ),
             disnake.ui.TextInput(
                 label="Кулдаун (пример: 3600, 1h 30m, 00:45:00)",
@@ -9024,10 +6033,10 @@ class RIMoneyModal(disnake.ui.Modal):
         self.mode = mode
 
     async def callback(self, inter: disnake.ModalInteraction):
-        money_raw = (inter.text_values.get("ri_money") or "").replace(" ", "")
+        money_raw = inter.text_values.get("ri_money") or ""
         cd_raw = (inter.text_values.get("ri_cd") or "").strip()
         try:
-            money_val = safe_int(money_raw, name="Сумма", min_v=1)
+            money_val, is_percent, is_debit = parse_money_income_input(money_raw)
         except ValueError as e:
             return await inter.response.send_message(embed=error_embed("Ошибка", str(e)), ephemeral=True)
         cd = parse_duration_to_seconds(cd_raw)
@@ -9044,7 +6053,9 @@ class RIMoneyModal(disnake.ui.Modal):
             money_val,
             [],
             cd,
-            created_by=(inter.user.id if self.mode == "add" else None)
+            created_by=(inter.user.id if self.mode == "add" else None),
+            money_is_percent=is_percent,
+            money_is_debit=is_debit
         )
 
         # ДОБАВЛЕНО: снимем состояние "после" и отправим лог
@@ -9305,7 +6316,9 @@ class RoleIncomeView(disnake.ui.View):
                 await i.response.send_modal(RIMoneyModal(
                     self, "edit", chosen["role_id"],
                     money_amount=current.get("money_amount", 0),
-                    cooldown_seconds=current.get("cooldown_seconds", 86400)
+                    cooldown_seconds=current.get("cooldown_seconds", 86400),
+                    money_is_percent=current.get("money_is_percent", False),
+                    money_is_debit=current.get("money_is_debit", False)
                 ))
             else:
                 await i.response.send_modal(RIItemsModal(
@@ -9531,9 +6544,7 @@ async def on_ready():
     setup_database()
     print(f'Бот {bot.user} готов к работе!')
     print(f'Подключен к {len(bot.guilds)} серверам.')
-    if not update_country_lists.is_running():
-        update_country_lists.start()
-
+    
 @bot.command(name="balance", aliases=["bal", "Bal", "Баланс", "Бал", "баланс", "бал", "BAL", "BALANCE", "БАЛАНС", "БАЛ", "Balance"])
 async def balance_prefix(ctx: commands.Context, user: disnake.Member = None):
     if not await ensure_allowed_ctx(ctx, ALLOWED_BALANCE):
@@ -10677,7 +7688,12 @@ def _build_income_list_embed(guild: disnake.Guild, data: list[dict], page: int, 
 
             # 2) Сумма или Ресурсы
             if ri["income_type"] == "money":
-                second = f"Сумма: {format_number(int(ri['money_amount'] or 0))}"
+                income = money_income_display(
+                    ri.get("money_amount", 0),
+                    is_percent=ri.get("money_is_percent", False),
+                    is_debit=ri.get("money_is_debit", False)
+                )
+                second = f"Сумма: {income}"
             else:
                 if not ri["items"]:
                     second = "Ресурсы: —"
@@ -10904,504 +7920,6 @@ def _mix_color_for(pct_for: int) -> disnake.Color:
     g = int(255 * pct_for / 100)
     b = 60
     return disnake.Color.from_rgb(r, g, b)
-
-
-# ========================= Создание типов техники =========================
-
-
-class TechTypeNameModal(disnake.ui.Modal):
-    def __init__(self, view_ref):
-        components = [
-            disnake.ui.TextInput(label="Название типа", custom_id="name", max_length=100),
-        ]
-        super().__init__(title="Название типа", components=components)
-        self.view_ref = view_ref
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        self.view_ref.type_name = inter.text_values.get("name", "").strip()
-        await inter.response.send_message("Название сохранено.", ephemeral=True)
-        if self.view_ref.message:
-            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
-
-
-class TechTypeItemModal(disnake.ui.Modal):
-    def __init__(self, view_ref):
-        components = [
-            disnake.ui.TextInput(label="Название предмета", custom_id="item", max_length=100),
-            disnake.ui.TextInput(label="Количество", custom_id="qty", max_length=10),
-        ]
-        super().__init__(title="Добавить предмет", components=components)
-        self.view_ref = view_ref
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        name = inter.text_values.get("item", "").strip()
-        qty_raw = inter.text_values.get("qty", "").strip()
-        try:
-            qty = int(qty_raw)
-        except ValueError:
-            qty = 0
-        if name and qty > 0:
-            self.view_ref.items.append((name, qty))
-            if self.view_ref.message:
-                await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
-        await inter.response.send_message("Предмет добавлен.", ephemeral=True)
-
-
-class TechBranchSelect(disnake.ui.StringSelect):
-    def __init__(self, view_ref):
-        options = [
-            disnake.SelectOption(label=label, value=code) for code, label in LICENSE_PERMISSION_LIST
-        ]
-        super().__init__(placeholder="Выберите род", options=options, custom_id="tech_branch_select")
-        self.view_ref = view_ref
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        code = self.values[0]
-        mapping = {c: l for c, l in LICENSE_PERMISSION_LIST}
-        self.view_ref.branch = mapping.get(code, code)
-        await inter.response.edit_message(content="Род выбран.", view=None)
-        if self.view_ref.message:
-            self.view_ref._sync_buttons_state()
-            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
-
-
-class TechBranchPickView(disnake.ui.View):
-    def __init__(self, view_ref):
-        super().__init__(timeout=60)
-        self.add_item(TechBranchSelect(view_ref))
-
-
-class ExistingTechTypeSelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view, types: list[dict]):
-        options = [
-            disnake.SelectOption(
-                label=t["name"],
-                value=str(t["id"]),
-                description=f"Цена: {format_number(t['price'])} {MONEY_EMOJI}"
-            )
-            for t in types
-        ]
-        super().__init__(placeholder="Выберите тип техники", options=options, custom_id="existing_tech_type")
-        self.parent_view = parent_view
-        self._map = {str(t["id"]): t for t in types}
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        info = self._map.get(self.values[0])
-        if not info:
-            return await inter.response.send_message("Некорректный выбор.", ephemeral=True)
-        self.parent_view.tech_type = info["name"]
-        self.parent_view.tech_type_id = info["id"]
-        self.parent_view.tech_price = info.get("price")
-        full = get_tech_type_by_id(inter.guild.id, info["id"])
-        self.parent_view.cost_items = full.get("required_items") if full else []
-        await inter.response.edit_message(content="Тип выбран.", view=None)
-        if self.parent_view.message:
-            self.parent_view._sync_buttons_state()
-            await self.parent_view.message.edit(embed=self.parent_view.build_embed(), view=self.parent_view)
-
-
-class ExistingTechTypePickView(disnake.ui.View):
-    def __init__(self, parent_view, types: list[dict]):
-        super().__init__(timeout=60)
-        self.add_item(ExistingTechTypeSelect(parent_view, types))
-
-
-class TechTypeView(disnake.ui.View):
-    def __init__(self, ctx: commands.Context):
-        super().__init__(timeout=180)
-        self.ctx = ctx
-        self.message: disnake.Message | None = None
-        self.type_name: str | None = None
-        self.branch: str | None = None
-        self.items: list[tuple[str, int]] = []
-
-    def build_embed(self) -> disnake.Embed:
-        e = disnake.Embed(title="Создание типа техники", color=disnake.Color.blurple())
-        _server_icon_and_name(e, self.ctx.guild, self.ctx.bot.user)
-        lines = [
-            "- Название:",
-            f"> {self.type_name or 'не указано'}",
-            "",
-            "- Выбранный род:",
-            f"> {self.branch or 'не выбран'}",
-            "",
-            "> Требуемые предметы:",
-        ]
-        if not self.items:
-            lines.append("—")
-        else:
-            for name, qty in self.items:
-                lines.append(f"{name} — {qty}")
-        e.description = "\n".join(lines)
-        return e
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        return inter.user.id == self.ctx.author.id
-
-    @disnake.ui.button(label="Название", style=disnake.ButtonStyle.primary)
-    async def set_name(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_modal(TechTypeNameModal(self))
-
-    @disnake.ui.button(label="Выбрать род", style=disnake.ButtonStyle.secondary)
-    async def pick_branch(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        view = TechBranchPickView(self)
-        await inter.response.send_message("Выберите род:", view=view, ephemeral=True)
-
-    @disnake.ui.button(label="Добавить предмет", style=disnake.ButtonStyle.success)
-    async def add_item(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.send_modal(TechTypeItemModal(self))
-
-    @disnake.ui.button(label="Удалить предмет", style=disnake.ButtonStyle.danger)
-    async def del_item(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if self.items:
-            self.items.pop()
-            if self.message:
-                await self.message.edit(embed=self.build_embed(), view=self)
-            await inter.response.send_message("Последний предмет удалён.", ephemeral=True)
-        else:
-            await inter.response.send_message("Нет предметов для удаления.", ephemeral=True)
-
-    @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.primary)
-    async def create(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if not self.type_name or not self.branch:
-            return await inter.response.send_message(
-                "Укажите название и род вооружения перед сохранением.",
-                ephemeral=True,
-            )
-        type_id = add_tech_type(self.ctx.guild.id, self.type_name, self.branch, self.items)
-        await inter.response.send_message(
-            f"Тип техники сохранён. ID: {type_id}",
-            ephemeral=True,
-        )
-        self.stop()
-
-
-# ========================= Создание техники страной =========================
-
-
-class TechNameModal(disnake.ui.Modal):
-    def __init__(self, view_ref):
-        components = [
-            disnake.ui.TextInput(label="Название", custom_id="name", max_length=100),
-        ]
-        super().__init__(title="Название", components=components)
-        self.view_ref = view_ref
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        self.view_ref.name = inter.text_values.get("name", "").strip()
-        await inter.response.send_message("Название установлено.", ephemeral=True)
-        if self.view_ref.message:
-            self.view_ref._sync_buttons_state()
-            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
-
-
-class TechDescriptionModal(disnake.ui.Modal):
-    def __init__(self, view_ref):
-        components = [
-            disnake.ui.TextInput(label="Описание", custom_id="desc", style=disnake.TextInputStyle.paragraph, max_length=500),
-        ]
-        super().__init__(title="Описание", components=components)
-        self.view_ref = view_ref
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        self.view_ref.description = inter.text_values.get("desc", "").strip()
-        await inter.response.send_message("Описание установлено.", ephemeral=True)
-        if self.view_ref.message:
-            self.view_ref._sync_buttons_state()
-            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
-
-
-class TechWikiModal(disnake.ui.Modal):
-    def __init__(self, view_ref):
-        components = [
-            disnake.ui.TextInput(label="Ссылка", custom_id="link", max_length=200),
-        ]
-        super().__init__(title="Ссылка на Wikipedia", components=components)
-        self.view_ref = view_ref
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        self.view_ref.wiki = inter.text_values.get("link", "").strip()
-        await inter.response.send_message("Ссылка сохранена.", ephemeral=True)
-        if self.view_ref.message:
-            self.view_ref._sync_buttons_state()
-            await self.view_ref.message.edit(embed=self.view_ref.build_embed(), view=self.view_ref)
-
-
-class TechCreateSelect(disnake.ui.StringSelect):
-    def __init__(self, parent_view):
-        options = [
-            disnake.SelectOption(label="Название", value="name"),
-            disnake.SelectOption(label="Род", value="branch"),
-            disnake.SelectOption(label="Тип", value="type"),
-            disnake.SelectOption(label="Описание", value="description"),
-            disnake.SelectOption(label="Ссылка на Wikipedia", value="wiki"),
-        ]
-        super().__init__(placeholder="Выберите параметр", options=options, custom_id="tech_create_select")
-        self.parent_view = parent_view
-
-    async def callback(self, inter: disnake.MessageInteraction):
-        val = self.values[0]
-        if val == "name":
-            await inter.response.send_modal(TechNameModal(self.parent_view))
-            return
-        if val == "description":
-            await inter.response.send_modal(TechDescriptionModal(self.parent_view))
-            return
-        if val == "wiki":
-            await inter.response.send_modal(TechWikiModal(self.parent_view))
-            return
-        if val == "branch":
-            view = TechBranchPickView(self.parent_view)
-            await inter.response.send_message("Выберите род:", view=view, ephemeral=True)
-            return
-        if val == "type":
-            if not self.parent_view.branch:
-                await inter.response.send_message("Сначала выберите род.", ephemeral=True)
-            else:
-                types = get_tech_types_by_branch(inter.guild.id, self.parent_view.branch)
-                if not types:
-                    await inter.response.send_message("Нет доступных типов для выбранного рода.", ephemeral=True)
-                else:
-                    view = ExistingTechTypePickView(self.parent_view, types)
-                    await inter.response.send_message("Выберите тип техники:", view=view, ephemeral=True)
-            return
-
-
-class TechApplicationModerationView(disnake.ui.View):
-    def __init__(self, applicant: disnake.Member, data: dict):
-        super().__init__(timeout=3600)
-        self.applicant = applicant
-        self.data = data
-        self.message: disnake.Message | None = None
-
-    def build_embed(self) -> disnake.Embed:
-        e = disnake.Embed(title="Заявка на технику", color=disnake.Color.blurple())
-        e.set_author(name=self.applicant.display_name, icon_url=self.applicant.display_avatar.url)
-        lines = [
-            "- Название",
-            f"> {self.data.get('name') or 'не указано'}",
-            "",
-            "- Род вооружения:",
-            f"> {self.data.get('branch') or 'не выбран'}",
-            "",
-            "- Тип",
-            f"> {self.data.get('tech_type_name') or 'не выбран'}",
-            "",
-            "- Цена:",
-        ]
-        items = self.data.get("cost_items") or []
-        if not items:
-            lines.append("> —")
-        else:
-            for name, qty in items:
-                lines.append(f"> {name} — {qty}")
-        lines.extend([
-            "",
-            "- Описание:",
-            f"> {self.data.get('description') or 'не указано'}",
-            "",
-            "Ссылка на Wikipedia:",
-            f"> {self.data.get('wiki') or 'не указана'}",
-            "",
-            "Лицензия:",
-            f"> {self.data.get('license') or '—'}",
-        ])
-        e.description = "\n".join(lines)
-        return e
-
-    @disnake.ui.button(label="Принять", style=disnake.ButtonStyle.success)
-    async def accept(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        price = int(self.data.get("tech_price") or 0)
-        cost_items = []
-        for name, qty in self.data.get("cost_items") or []:
-            item = get_item_by_name(inter.guild.id, name)
-            if item:
-                try:
-                    cost_items.append({"item_id": int(item["id"]), "qty": int(qty)})
-                except Exception:
-                    continue
-        flag = self.data.get("flag") or ""
-        type_name = self.data.get("tech_type_name") or ""
-        base_name = self.data.get("name") or "Предмет"
-        item_name = f"{flag}[{type_name}] {base_name}".strip()
-        add_shop_item_from_tech(
-            inter.guild.id,
-            item_name,
-            price,
-            self.data.get("description") or "",
-            cost_items,
-            self.data.get("license_code"),
-        )
-        await inter.response.send_message("Заявка принята.", ephemeral=True)
-        with contextlib.suppress(Exception):
-            await self.applicant.send(f"Ваша техника '{self.data.get('name')}' одобрена.")
-        self.stop()
-
-    @disnake.ui.button(label="Отклонить", style=disnake.ButtonStyle.danger)
-    async def reject(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        modal = TechRejectModal(self.applicant)
-        await inter.response.send_modal(modal)
-        self.stop()
-
-    @disnake.ui.button(label="Изменить", style=disnake.ButtonStyle.secondary)
-    async def edit(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        async def on_submit(view: CountryTechCreateView, i: disnake.MessageInteraction):
-            self.data.update({
-                "name": view.name,
-                "branch": view.branch,
-                "tech_type_id": view.tech_type_id,
-                "tech_type_name": view.tech_type,
-                "tech_price": view.tech_price,
-                "cost_items": view.cost_items,
-                "description": view.description,
-                "wiki": view.wiki,
-            })
-            if self.message:
-                await self.message.edit(embed=self.build_embed(), view=self)
-            await i.response.send_message("Изменено.", ephemeral=True)
-            view.stop()
-
-        view = CountryTechCreateView(self.applicant, inter.user.id, on_submit=on_submit)
-        view.name = self.data.get("name")
-        view.branch = self.data.get("branch")
-        view.tech_type_id = self.data.get("tech_type_id")
-        view.tech_type = self.data.get("tech_type_name")
-        view.tech_price = self.data.get("tech_price")
-        view.cost_items = self.data.get("cost_items", [])
-        view.description = self.data.get("description")
-        view.wiki = self.data.get("wiki")
-        view._sync_buttons_state()
-        await inter.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
-        view.message = await inter.original_message()
-
-
-class TechRejectModal(disnake.ui.Modal):
-    def __init__(self, applicant: disnake.Member):
-        components = [
-            disnake.ui.TextInput(label="Причина", custom_id="reason", style=disnake.TextInputStyle.paragraph),
-        ]
-        super().__init__(title="Причина отказа", components=components)
-        self.applicant = applicant
-
-    async def callback(self, inter: disnake.ModalInteraction):
-        reason = inter.text_values.get("reason", "").strip() or "Причина не указана"
-        with contextlib.suppress(Exception):
-            await self.applicant.send(f"Ваша заявка отклонена: {reason}")
-        await inter.response.send_message("Отказ отправлен.", ephemeral=True)
-
-
-class CountryTechCreateView(disnake.ui.View):
-    def __init__(self, target: disnake.Member, author_id: int, on_submit: Callable[["CountryTechCreateView", disnake.MessageInteraction], Awaitable[None]] | None = None):
-        super().__init__(timeout=180)
-        self.target = target
-        self.author_id = author_id
-        self.on_submit = on_submit
-        self.message: disnake.Message | None = None
-        self.name: str | None = None
-        self.branch: str | None = None
-        self.tech_type: str | None = None
-        self.tech_type_id: int | None = None
-        self.tech_price: int | None = None
-        self.cost_items: list[tuple[str, int]] = []
-        self.description: str | None = None
-        self.wiki: str | None = None
-
-        code = country_get_registration_for_user(target.guild.id, target.id)
-        info = country_get_by_code_or_name(target.guild.id, code) if code else None
-        self.license_code = code
-        self.flag = normalize_flag_emoji(info.get("flag"), code_hint=code) if info else ""
-        self.license_name = build_country_license_name(info) if info else "—"
-
-        self.add_item(TechCreateSelect(self))
-        self._sync_buttons_state()
-
-    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
-        if inter.user.id != self.author_id:
-            await inter.response.send_message("Эта панель доступна только инициатору.", ephemeral=True)
-            return False
-        return True
-
-    def _sync_buttons_state(self):
-        for child in self.children:
-            if isinstance(child, disnake.ui.Button) and child.custom_id == "country_tech_confirm":
-                child.disabled = not all([
-                    self.name,
-                    self.branch,
-                    self.tech_type_id,
-                    self.description,
-                    self.wiki,
-                ])
-
-    def build_embed(self) -> disnake.Embed:
-        e = disnake.Embed(title="Создание техники", color=disnake.Color.blurple())
-        e.set_author(name=self.target.display_name, icon_url=self.target.display_avatar.url)
-        lines = [
-            "- Название",
-            f"> {self.name or 'не указано'}",
-            "",
-            "- Род вооружения:",
-            f"> {self.branch or 'не выбран'}",
-            "",
-            "- Тип",
-            f"> {self.tech_type or 'не выбран'}",
-            "",
-            "- Цена:",
-        ]
-        if not self.cost_items:
-            lines.append("> —")
-        else:
-            for name, qty in self.cost_items:
-                lines.append(f"> {name} — {qty}")
-        lines.extend([
-            "",
-            "- Описание:",
-            f"> {self.description or 'не указано'}",
-            "",
-            "- Ссылка на Wikipedia:",
-            f"> {self.wiki or 'не указана'}",
-            "",
-            "- Лицензия:",
-            f"> {self.license_name}",
-        ])
-        e.description = "\n".join(lines)
-        return e
-
-    @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.success, custom_id="country_tech_confirm")
-    async def confirm(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        if self.on_submit:
-            await self.on_submit(self, inter)
-            return
-
-        data = {
-            "name": self.name,
-            "branch": self.branch,
-            "tech_type_id": self.tech_type_id,
-            "tech_type_name": self.tech_type,
-            "tech_price": self.tech_price,
-            "cost_items": self.cost_items,
-            "description": self.description,
-            "wiki": self.wiki,
-            "license": self.license_name,
-            "license_code": self.license_code,
-            "flag": self.flag,
-        }
-        channel = inter.guild.get_channel(TECH_APPLICATION_CHANNEL_ID)
-        if channel:
-            mod_view = TechApplicationModerationView(self.target, data)
-            embed = mod_view.build_embed()
-            msg = await channel.send(
-                f"Заявка на технику от {self.target.mention}",
-                embed=embed,
-                view=mod_view,
-            )
-            mod_view.message = msg
-        await inter.response.send_message("Заявка отправлена.", ephemeral=True)
-        self.stop()
-
-    @disnake.ui.button(label="Отменить", style=disnake.ButtonStyle.secondary)
-    async def cancel(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        await inter.response.edit_message(content="Создание техники отменено.", embed=None, view=None)
-        self.stop()
 
 @dataclass
 class Candidate:
@@ -12446,19 +8964,28 @@ async def collect_cmd(ctx: commands.Context):
 
     # Выдаём доход
     total_money = 0
-    money_lines = []
-    item_lines = []
+    money_lines: list[str] = []
+    item_lines: list[str] = []
     id2name = items_id_to_name_map(ctx.guild)
+    money_results: list[dict] = []  # {'ri': dict, 'amount': int, 'base': Optional[int]}
+    percent_indices: list[int] = []
 
     for ri in ready:
         if ri["income_type"] == "money":
-            amt = int(ri["money_amount"] or 0)
-            if amt > 0:
-                total_money += amt
-                money_lines.append(f"<@&{ri['role_id']}> → {format_number(amt)} {MONEY_EMOJI} (cash)")
+            base_value = abs(int(ri.get("money_amount") or 0))
+            is_percent = bool(ri.get("money_is_percent"))
+            is_debit = bool(ri.get("money_is_debit"))
+            if is_percent:
+                percent_indices.append(len(money_results))
+                money_results.append({"ri": ri, "amount": 0, "base": None})
+            else:
+                signed = -base_value if (is_debit and base_value) else base_value
+                total_money += signed
+                money_results.append({"ri": ri, "amount": signed, "base": None})
         else:
             # Предметы
             if not ri["items"]:
+                db_set_ri_last_ts(ctx.guild.id, ri["role_id"], member.id, now)
                 continue
             sub_lines = []
             for it in ri["items"]:
@@ -12477,7 +9004,54 @@ async def collect_cmd(ctx: commands.Context):
         # зафиксировать кулдаун для этой роли
         db_set_ri_last_ts(ctx.guild.id, ri["role_id"], member.id, now)
 
-    if total_money > 0:
+    percent_base = sum(entry["amount"] for entry in money_results if entry["amount"] > 0)
+    if percent_base < 0:
+        percent_base = 0
+
+    for idx in percent_indices:
+        entry = money_results[idx]
+        ri = entry["ri"]
+        pct_value = abs(int(ri.get("money_amount") or 0))
+        is_debit = bool(ri.get("money_is_debit"))
+        computed = 0
+        if pct_value > 0 and percent_base > 0:
+            base_mult = percent_base * pct_value
+            computed = base_mult // 100
+            if base_mult % 100 >= 50:
+                computed += 1
+        signed = -computed if (is_debit and computed) else computed
+        total_money += signed
+        entry["amount"] = signed
+        entry["base"] = percent_base
+
+    for entry in money_results:
+        ri = entry["ri"]
+        signed = int(entry.get("amount") or 0)
+        base = entry.get("base")
+        role_mention = f"<@&{ri['role_id']}>"
+        if ri.get("money_is_percent"):
+            cfg_short = money_income_display(
+                ri.get("money_amount", 0),
+                is_percent=True,
+                is_debit=ri.get("money_is_debit", False),
+                include_suffix=False
+            )
+            base_value = int(base or 0)
+            base_text = format_number(base_value)
+            money_lines.append(
+                f"{role_mention} → {signed_money_amount(signed)} "
+                f"({cfg_short} от {base_text} {MONEY_EMOJI})"
+            )
+        else:
+            cfg_short = money_income_display(
+                ri.get("money_amount", 0),
+                is_percent=False,
+                is_debit=ri.get("money_is_debit", False),
+                include_suffix=False
+            )
+            money_lines.append(f"{role_mention} → {signed_money_amount(signed)} (настройка: {cfg_short})")
+
+    if total_money != 0:
         update_balance(ctx.guild.id, member.id, total_money)
 
     # Собираем эмбед результата
@@ -12489,47 +9063,13 @@ async def collect_cmd(ctx: commands.Context):
 
     e.add_field(name=":moneybag: Денежный доход:", value="\n".join(money_lines) if money_lines else "—", inline=False)
     e.add_field(name=":pick: Доход ресурсов:", value="\n".join(item_lines) if item_lines else "—", inline=False)
-    e.add_field(name=":bar_chart: Итоговый доход:",
-    value=f"\n*{format_number(total_money)} {MONEY_EMOJI}*\n", inline=False)
+    total_text = signed_money_amount(total_money)
+    e.add_field(name=":bar_chart: Итоговый доход:", value=f"\n*{total_text}*\n", inline=False)
 
     server_icon = getattr(ctx.guild.icon, "url", None)
     footer_time = datetime.now().strftime("%d.%m.%Y %H:%M")
     e.set_footer(text=f"{ctx.guild.name} • {footer_time}", icon_url=server_icon)
 
-    await ctx.send(embed=e)
-
-
-@bot.command(name="type-tech")
-async def type_tech_cmd(ctx: commands.Context):
-    """Открывает меню создания типа техники."""
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    view = TechTypeView(ctx)
-    msg = await ctx.send(embed=view.build_embed(), view=view)
-    view.message = msg
-
-
-@bot.command(name="type-list")
-async def type_list_cmd(ctx: commands.Context):
-    """Отображает созданные типы техники и их параметры."""
-    if not ctx.guild:
-        return await ctx.send("Команда доступна только на сервере.")
-    types = get_all_tech_types(ctx.guild.id)
-    if not types:
-        return await ctx.send("Типы техники не найдены.")
-    e = disnake.Embed(title="Список типов техники", color=disnake.Color.blurple())
-    _server_icon_and_name(e, ctx.guild, ctx.bot.user)
-    lines = []
-    for t in types:
-        lines.append(f"**{t['id']}. {t['name']}** ({t['branch']})")
-        items = t.get("required_items") or []
-        if items:
-            for name, qty in items:
-                lines.append(f"- {name} — {qty}")
-        else:
-            lines.append("- —")
-        lines.append("")
-    e.description = "\n".join(lines).rstrip()
     await ctx.send(embed=e)
 
 
