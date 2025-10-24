@@ -72,6 +72,15 @@ ALLOWED_LOG_MENU = ["Administrator"]  # кто может использоват
 ALLOWED_INCOME_LIST = []  # кто может использовать !income-list (пусто = все)
 ALLOWED_ROLE_COMMANDS = ["Administrator", 1365552181020987492]  # имя-метка под ваш permission-роутер
 
+# ===== Доступ к лицензиям =====
+ALLOWED_LICENSE_CREATE = ["Administrator"]
+ALLOWED_LICENSE_DELETE = ["Administrator"]
+ALLOWED_LICENSE_GIVE = ["Administrator"]
+ALLOWED_LICENSE_TAKE = ["Administrator"]
+
+# ===== Доступ к модерации сообщений =====
+ALLOWED_CLEAR_MESSAGES = ["Administrator"]
+
 # ===== Доступ для стран =====
 ALLOWED_CREATE_COUNTRY = ["Administrator"]
 ALLOWED_EDIT_COUNTRY = ["Administrator"]
@@ -151,6 +160,15 @@ USAGE_HINTS: dict[str, str] = {
     "income-list": "!income-list",
     # Логи
     "logmenu": "!logmenu",
+    "mylic": "!mylic",
+    "clear": "!clear <количество> [@пользователь]",
+    "give-lic": "!give-lic @пользователь <Название лицензии>",
+    "take-lic": "!take-lic @пользователь <Название лицензии>",
+    "create-lic": "!create-lic",
+    "delete-lic": "!delete-lic",
+    "lic-list": "!lic-list",
+    "lic-info": "!lic-info <Название лицензии>",
+    "lic-user": "!lic-user @пользователь",
 }
 
 def usage_embed(cmd_name: str) -> disnake.Embed:
@@ -259,6 +277,35 @@ def setup_database():
         )
     """)
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            guild_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            name_lower TEXT NOT NULL,
+            created_by INTEGER,
+            created_ts INTEGER,
+            UNIQUE (guild_id, name_lower)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_licenses (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            license_id INTEGER NOT NULL,
+            granted_by INTEGER,
+            granted_ts INTEGER,
+            PRIMARY KEY (guild_id, user_id, license_id)
+        )
+    """)
+
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_licenses_guild ON licenses (guild_id, name_lower)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_user_licenses_guild ON user_licenses (guild_id, user_id)")
+
+    conn.commit()
+    conn.close()
+
 MAX_SQL_INT = 9_223_372_036_854_775_807
 MIN_SQL_INT = -9_223_372_036_854_775_808
 
@@ -301,6 +348,351 @@ def safe_int(v: int, *, name: str = "value", min_v: int = 0, max_v: int = MAX_SQ
     if iv < min_v or iv > max_v:
         raise ValueError(f"{name}: выходит за допустимые пределы [{min_v}; {max_v}].")
     return iv
+
+LICENSE_NAME_MAX_LEN = 64
+
+
+def normalize_license_name(name: str) -> str:
+    return re.sub(r"\s+", " ", (name or "").strip())
+
+
+def _license_row_to_dict(row) -> Optional[dict]:
+    if not row:
+        return None
+    if isinstance(row, sqlite3.Row):
+        data = dict(row)
+    else:
+        data = {
+            "id": row[0],
+            "guild_id": row[1],
+            "name": row[2],
+            "name_lower": row[3],
+            "created_by": row[4],
+            "created_ts": row[5],
+        }
+    data["id"] = int(data["id"])
+    data["guild_id"] = int(data["guild_id"])
+    data["name"] = str(data.get("name", ""))
+    data["name_lower"] = str(data.get("name_lower", ""))
+    if data.get("created_by") is not None:
+        data["created_by"] = int(data["created_by"])
+    if data.get("created_ts") is not None:
+        data["created_ts"] = int(data["created_ts"])
+    return data
+
+
+def create_license(guild_id: int, name: str, actor_id: int) -> tuple[bool, Optional[str], Optional[dict]]:
+    normalized = normalize_license_name(name)
+    if not normalized:
+        return False, "Название лицензии не может быть пустым.", None
+    if len(normalized) > LICENSE_NAME_MAX_LEN:
+        return False, f"Название лицензии не может превышать {LICENSE_NAME_MAX_LEN} символов.", None
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    ts = int(time.time())
+    try:
+        c.execute(
+            """
+            INSERT INTO licenses (guild_id, name, name_lower, created_by, created_ts)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (guild_id, normalized, normalized.lower(), actor_id, ts),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, "Лицензия с таким названием уже существует.", None
+    license_id = int(c.lastrowid or 0)
+    conn.commit()
+    conn.close()
+    license_data = {
+        "id": license_id,
+        "guild_id": guild_id,
+        "name": normalized,
+        "name_lower": normalized.lower(),
+        "created_by": actor_id,
+        "created_ts": ts,
+    }
+    return True, None, license_data
+
+
+def get_license_by_name(guild_id: int, name: str) -> Optional[dict]:
+    normalized = normalize_license_name(name)
+    if not normalized:
+        return None
+    conn = sqlite3.connect(get_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE guild_id = ? AND name_lower = ?", (guild_id, normalized.lower()))
+    row = c.fetchone()
+    conn.close()
+    return _license_row_to_dict(row)
+
+
+def search_licenses_by_name(guild_id: int, query: str, limit: int = 20) -> list[dict]:
+    normalized = normalize_license_name(query)
+    if not normalized:
+        return []
+
+    query_lower = normalized.lower()
+    licenses = list_licenses(guild_id)
+    scored: list[tuple[float, dict]] = []
+
+    for lic in licenses:
+        name_lower = lic.get("name_lower", "").lower()
+        if not name_lower:
+            continue
+
+        if name_lower == query_lower:
+            score = 2.0
+        elif query_lower in name_lower:
+            score = 1.5
+        else:
+            similarity = SequenceMatcher(None, name_lower, query_lower).ratio()
+            if similarity < 0.4:
+                continue
+            score = similarity
+
+        scored.append((score, lic))
+
+    scored.sort(key=lambda item: (-item[0], item[1]["name_lower"]))
+    return [lic for _, lic in scored[:limit]]
+
+
+def get_license_by_id(guild_id: int, license_id: int) -> Optional[dict]:
+    conn = sqlite3.connect(get_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE guild_id = ? AND id = ?", (guild_id, license_id))
+    row = c.fetchone()
+    conn.close()
+    return _license_row_to_dict(row)
+
+
+def list_licenses(guild_id: int) -> list[dict]:
+    conn = sqlite3.connect(get_db_path())
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE guild_id = ? ORDER BY name_lower", (guild_id,))
+    rows = c.fetchall()
+    conn.close()
+    return [_license_row_to_dict(r) for r in rows if r]
+
+
+def delete_license(guild_id: int, license_id: int) -> tuple[bool, Optional[str]]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute("SELECT id FROM licenses WHERE guild_id = ? AND id = ?", (guild_id, license_id))
+    if c.fetchone() is None:
+        conn.close()
+        return False, "Лицензия не найдена."
+    c.execute("DELETE FROM user_licenses WHERE guild_id = ? AND license_id = ?", (guild_id, license_id))
+    c.execute("UPDATE items SET license_id = NULL WHERE guild_id = ? AND license_id = ?", (guild_id, license_id))
+    c.execute("UPDATE countries SET license_id = NULL WHERE guild_id = ? AND license_id = ?", (guild_id, license_id))
+    c.execute("DELETE FROM licenses WHERE guild_id = ? AND id = ?", (guild_id, license_id))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def grant_license(guild_id: int, user_id: int, license_id: int, actor_id: int) -> tuple[bool, Optional[str]]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    ts = int(time.time())
+    try:
+        c.execute(
+            """
+            INSERT INTO user_licenses (guild_id, user_id, license_id, granted_by, granted_ts)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (guild_id, user_id, license_id, actor_id, ts),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False, "У пользователя уже есть эта лицензия."
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def revoke_license(guild_id: int, user_id: int, license_id: int) -> tuple[bool, Optional[str]]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute("DELETE FROM user_licenses WHERE guild_id = ? AND user_id = ? AND license_id = ?", (guild_id, user_id, license_id))
+    if c.rowcount == 0:
+        conn.close()
+        return False, "У пользователя нет этой лицензии."
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def user_has_license(guild_id: int, user_id: int, license_id: int) -> bool:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM user_licenses WHERE guild_id = ? AND user_id = ? AND license_id = ?", (guild_id, user_id, license_id))
+    has = c.fetchone() is not None
+    conn.close()
+    return has
+
+
+def get_user_licenses(guild_id: int, user_id: int) -> list[dict]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT l.id, l.guild_id, l.name, l.name_lower, l.created_by, l.created_ts,
+               ul.granted_by, ul.granted_ts
+        FROM user_licenses ul
+        JOIN licenses l ON l.id = ul.license_id
+        WHERE ul.guild_id = ? AND ul.user_id = ?
+        ORDER BY l.name_lower
+        """,
+        (guild_id, user_id),
+    )
+    rows = c.fetchall()
+    conn.close()
+    result: list[dict] = []
+    for row in rows:
+        lic = _license_row_to_dict(row)
+        if not lic:
+            continue
+        lic["granted_by"] = None if row[6] is None else int(row[6])
+        lic["granted_ts"] = None if row[7] is None else int(row[7])
+        result.append(lic)
+    return result
+
+
+def get_license_holders(guild_id: int, license_id: int) -> list[dict]:
+    conn = sqlite3.connect(get_db_path())
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT user_id, granted_by, granted_ts
+        FROM user_licenses
+        WHERE guild_id = ? AND license_id = ?
+        ORDER BY granted_ts ASC
+        """,
+        (guild_id, license_id),
+    )
+    rows = c.fetchall()
+    conn.close()
+    holders: list[dict] = []
+    for row in rows:
+        holders.append({
+            "user_id": int(row[0]),
+            "granted_by": None if row[1] is None else int(row[1]),
+            "granted_ts": None if row[2] is None else int(row[2]),
+        })
+    return holders
+
+
+def get_license_name_map(guild_id: int) -> dict[int, str]:
+    return {lic["id"]: lic["name"] for lic in list_licenses(guild_id)}
+
+
+def format_license_name(guild_id: int, license_id: Optional[int]) -> str:
+    if not license_id:
+        return "—"
+    info = get_license_by_id(guild_id, int(license_id))
+    return info["name"] if info else "—"
+
+
+LICENSE_SELECTION_CANCEL_WORDS = {"cancel", "отмена", "stop", "стоп"}
+
+
+async def resolve_license_by_user_query(
+    ctx: commands.Context,
+    raw_query: str,
+    *,
+    prompt_title: str,
+    no_matches_title: str = "Лицензия не найдена",
+    no_matches_description: str = "Совпадения отсутствуют. Проверьте ввод и попробуйте снова.",
+    timeout: int = 60,
+    attempts: int = 3,
+    search_limit: int = 20,
+) -> tuple[Optional[dict], Optional[tuple[str, str]]]:
+    if not ctx.guild:
+        return None, ("Поиск лицензии", "Эта команда доступна только на сервере.")
+
+    attempts = max(1, int(attempts))
+    timeout = max(1, int(timeout))
+
+    normalized = normalize_license_name(raw_query)
+    if not normalized:
+        return None, ("Поиск лицензии", "Название лицензии не может быть пустым.")
+
+    direct = get_license_by_name(ctx.guild.id, normalized)
+    if direct:
+        return direct, None
+
+    matches = search_licenses_by_name(ctx.guild.id, normalized, limit=search_limit)
+    if not matches:
+        return None, (no_matches_title, no_matches_description)
+
+    display_query = normalized
+    count = len(matches)
+    instructions = [
+        f"Найдено несколько лицензий по запросу «{display_query}».",
+        f"Введите число от 1 до {count}, чтобы выбрать лицензию.",
+        f"У вас {attempts} попыток и {timeout} секунд на ответ.",
+        "Для отмены введите `отмена`.",
+        "",
+    ]
+
+    for idx, lic in enumerate(matches, start=1):
+        instructions.append(f"**{idx}.** {lic['name']} (ID: {lic['id']})")
+
+    if count == search_limit:
+        instructions.append("")
+        instructions.append("Показаны наиболее подходящие лицензии. Уточните запрос, чтобы сузить результаты.")
+
+    embed = disnake.Embed(title=prompt_title, description="\n".join(instructions), color=disnake.Color.blurple())
+    prompt_message = await ctx.send(embed=embed)
+
+    def check(message: disnake.Message) -> bool:
+        return message.author.id == ctx.author.id and message.channel.id == ctx.channel.id
+
+    wait_timeout = timeout / attempts if attempts else timeout
+
+    for _ in range(attempts):
+        try:
+            reply = await ctx.bot.wait_for("message", timeout=wait_timeout, check=check)
+        except asyncio.TimeoutError:
+            break
+
+        content = reply.content.strip()
+        lower_content = content.lower()
+
+        with contextlib.suppress(disnake.HTTPException):
+            await reply.delete()
+
+        if lower_content in LICENSE_SELECTION_CANCEL_WORDS:
+            with contextlib.suppress(disnake.HTTPException):
+                await prompt_message.delete()
+            return None, ("Операция отменена", "Вы отменили выбор лицензии.")
+
+        if content.isdigit():
+            choice = int(content)
+            if 1 <= choice <= count:
+                selected = matches[choice - 1]
+                with contextlib.suppress(disnake.HTTPException):
+                    await prompt_message.delete()
+                return selected, None
+
+        await ctx.send(f"Неверный ввод. Введите число от 1 до {count} или `отмена`.", delete_after=10)
+
+    with contextlib.suppress(disnake.HTTPException):
+        await prompt_message.delete()
+
+    return None, ("Время истекло", "Не удалось выбрать лицензию вовремя. Попробуйте снова.")
+
+
+def format_timestamp_full(ts: Optional[int]) -> str:
+    if not ts:
+        return "—"
+    ts = int(ts)
+    return f"<t:{ts}:F> (<t:{ts}:R>)"
+
 
 def get_top_balances(guild_id: int, limit: int, offset: int = 0) -> List[Tuple[int, int]]:
     conn = sqlite3.connect(get_db_path())
@@ -585,7 +977,7 @@ def setup_country_tables():
             created_by INTEGER,
             created_ts INTEGER,
             updated_ts INTEGER,
-            license_role_id INTEGER,
+            license_id INTEGER,
             PRIMARY KEY (guild_id, code)
         )
     """)
@@ -601,11 +993,11 @@ def setup_country_tables():
         )
     """)
     c.execute("CREATE INDEX IF NOT EXISTS idx_countries_name ON countries (guild_id, name)")
-    # Миграция license_role_id
+    # Миграция license_id
     c.execute("PRAGMA table_info(countries)")
     cols = {row[1] for row in c.fetchall()}
-    if "license_role_id" not in cols:
-        c.execute("ALTER TABLE countries ADD COLUMN license_role_id INTEGER")
+    if "license_id" not in cols:
+        c.execute("ALTER TABLE countries ADD COLUMN license_id INTEGER")
     conn.commit()
     conn.close()
 
@@ -666,7 +1058,7 @@ def country_insert_or_update(
     population: int,
     sea_access: bool,
     actor_id: int,
-    license_role_id: Optional[int] = None
+    license_id: Optional[int] = None
 ) -> tuple[bool, str | None]:
     code = code.strip().upper()
     conn = sqlite3.connect(get_db_path())
@@ -680,10 +1072,10 @@ def country_insert_or_update(
             c.execute("""
                 INSERT INTO countries
                 (guild_id, code, name, flag, ruler, continent, territory_km2, population, sea_access,
-                 created_by, created_ts, updated_ts, license_role_id)
+                 created_by, created_ts, updated_ts, license_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (guild_id, code, name, flag, ruler, continent, territory_km2, population, 1 if sea_access else 0,
-                  actor_id, ts, ts, license_role_id))
+                  actor_id, ts, ts, license_id))
             conn.commit()
         else:
             # проверка смены кода
@@ -693,10 +1085,10 @@ def country_insert_or_update(
             c.execute("""
                 UPDATE countries
                    SET code=?, name=?, flag=?, ruler=?, continent=?, territory_km2=?, population=?,
-                       sea_access=?, updated_ts=?, license_role_id=?
+                       sea_access=?, updated_ts=?, license_id=?
                  WHERE guild_id=? AND upper(code)=upper(?)
             """, (code, name, flag, ruler, continent, territory_km2, population,
-                  1 if sea_access else 0, ts, license_role_id, guild_id, old_code.strip().upper()))
+                  1 if sea_access else 0, ts, license_id, guild_id, old_code.strip().upper()))
             if c.rowcount == 0:
                 conn.close()
                 return False, "Страна для редактирования не найдена."
@@ -856,7 +1248,7 @@ class CountryDraft:
     territory_km2: Optional[int] = None
     population: Optional[int] = None
     sea_access: Optional[bool] = None
-    license_role_id: Optional[int] = None   # <<< НОВОЕ
+    license_id: Optional[int] = None   # <<< НОВОЕ
 
 
 def _ok(v) -> bool:
@@ -976,66 +1368,87 @@ class SeaAccessSelectView(disnake.ui.View):
 
 # ===== Вью выбора лицензии (универсальная) =====
 
-def build_license_pick_embed(invoker: disnake.Member, title: str = "Выбор роли лицензии", current_role_id: Optional[int] = None) -> disnake.Embed:
-    cur_txt = f"Текущая: <@&{current_role_id}>\n" if current_role_id else ""
+def build_license_pick_embed(
+    invoker: disnake.Member,
+    guild_id: int,
+    title: str = "Выбор лицензии",
+    current_license_id: Optional[int] = None,
+    has_licenses: bool = True,
+) -> disnake.Embed:
+    current_txt = format_license_name(guild_id, current_license_id)
+    description_lines = [f"Текущая лицензия: {current_txt}"]
+    if has_licenses:
+        description_lines.append("Выберите нужную лицензию из списка ниже и подтвердите выбор.")
+        description_lines.append("Чтобы снять требование, выберите пункт «Без лицензии».")
+    else:
+        description_lines.append("На сервере пока нет созданных лицензий. Используйте команду !create-lic.")
     e = disnake.Embed(
         title=title,
-        description=(cur_txt + "Выберите роль (можно искать) и нажмите «Подтвердить»."),
+        description="\n".join(description_lines),
         color=disnake.Color.from_rgb(88, 101, 242)
     )
     e.set_author(name=invoker.display_name, icon_url=invoker.display_avatar.url)
     return e
 
 
-class LicenseRolePickView(disnake.ui.View):
-    """
-    Универсальное окно выбора роли лицензии в стиле !role-income:
-    - RoleSelect с поиском
-    - Кнопки Подтвердить/Отмена
-    - Ephemeral
-    """
+class LicensePickView(disnake.ui.View):
+    """Универсальный выбор лицензии через StringSelect."""
+    
     def __init__(
         self,
         ctx: commands.Context,
-        on_pick,  # async def (role_id: int, inter: disnake.MessageInteraction) -> None
-        current_role_id: Optional[int] = None,
-        timeout: float = 120.0
+        licenses: list[dict],
+        on_pick,  # async def (license_id: Optional[int], inter: disnake.MessageInteraction) -> None
+        current_license_id: Optional[int] = None,
+        timeout: float = 120.0,
     ):
         super().__init__(timeout=timeout)
         self.ctx = ctx
         self.on_pick = on_pick
-        self.current_role_id = current_role_id
+        self.current_license_id = current_license_id
         self.message: Optional[disnake.Message] = None
-        self._chosen_role_id: Optional[int] = None
+        self._chosen_license_id: Optional[int] = current_license_id
+        self._licenses = licenses
 
-        # Выбор роли (как в !role-income: с поиском, 1 значение)
-        self.role_select = disnake.ui.RoleSelect(
-            custom_id="license_pick_role",
-            placeholder="Выберите роль лицензии (можно искать)",
+        options: list[disnake.SelectOption] = [
+            disnake.SelectOption(label="Без лицензии", value="none", description="Снять требование лицензии")
+        ]
+        for lic in licenses[:24]:  # учитываем ограничение в 25 опций
+            options.append(disnake.SelectOption(label=lic["name"][:100], value=str(lic["id"])))
+
+        disabled = len(options) == 1  # только "Без лицензии"
+        self.license_select = disnake.ui.StringSelect(
+            custom_id="license_pick_select",
+            placeholder="Выберите лицензию" if not disabled else "Нет доступных лицензий",
             min_values=1,
-            max_values=1
+            max_values=1,
+            options=options,
+            disabled=disabled,
         )
         self.btn_confirm = disnake.ui.Button(label="Подтвердить", style=disnake.ButtonStyle.primary, custom_id="license_pick_confirm")
-        self.btn_cancel  = disnake.ui.Button(label="Отмена",      style=disnake.ButtonStyle.secondary, custom_id="license_pick_cancel")
+        self.btn_cancel = disnake.ui.Button(label="Отмена", style=disnake.ButtonStyle.secondary, custom_id="license_pick_cancel")
 
-        async def on_role_pick(i: disnake.MessageInteraction):
-            picked = self.role_select.values[0] if self.role_select.values else None
-            if not picked:
-                return await i.response.send_message("Не удалось определить роль.", ephemeral=True)
-            if picked.is_default():
-                return await i.response.send_message("Нельзя выбрать @everyone.", ephemeral=True)
-            self._chosen_role_id = int(picked.id)
+        async def on_select(i: disnake.MessageInteraction):
+            value = self.license_select.values[0] if self.license_select.values else None
+            if value == "none":
+                self._chosen_license_id = None
+            elif value is not None:
+                try:
+                    self._chosen_license_id = int(value)
+                except ValueError:
+                    self._chosen_license_id = None
             await i.response.defer()
 
         async def on_confirm(i: disnake.MessageInteraction):
-            if not self._chosen_role_id:
-                return await i.response.send_message("Сначала выберите роль.", ephemeral=True)
-            await self.on_pick(self._chosen_role_id, i)
-            # Закрываем мини-меню
+            if self._chosen_license_id is None and (self.license_select.disabled and self.current_license_id is None):
+                return await i.response.send_message("На сервере нет лицензий для выбора.", ephemeral=True)
+            await self.on_pick(self._chosen_license_id, i)
+            chosen_name = format_license_name(i.guild.id if i.guild else self.ctx.guild.id, self._chosen_license_id)
+            msg = f"✅ Выбрана лицензия: {chosen_name}"
             try:
-                await i.response.edit_message(content=f"✅ Роль выбрана: <@&{self._chosen_role_id}>", view=None, embed=None)
+                await i.response.edit_message(content=msg, view=None, embed=None)
             except Exception:
-                await i.followup.send(f"✅ Роль выбрана: <@&{self._chosen_role_id}>", ephemeral=True)
+                await i.followup.send(msg, ephemeral=True)
 
         async def on_cancel(i: disnake.MessageInteraction):
             try:
@@ -1043,11 +1456,11 @@ class LicenseRolePickView(disnake.ui.View):
             except Exception:
                 await i.followup.send("Отменено.", ephemeral=True)
 
-        self.role_select.callback = on_role_pick
+        self.license_select.callback = on_select
         self.btn_confirm.callback = on_confirm
         self.btn_cancel.callback = on_cancel
 
-        self.add_item(self.role_select)
+        self.add_item(self.license_select)
         self.add_item(self.btn_confirm)
         self.add_item(self.btn_cancel)
 
@@ -1056,6 +1469,16 @@ class LicenseRolePickView(disnake.ui.View):
             await inter.response.send_message("Это меню не для вас.", ephemeral=True)
             return False
         return True
+
+    async def on_timeout(self):
+        try:
+            for child in self.children:
+                if isinstance(child, (disnake.ui.Button, disnake.ui.SelectBase)):
+                    child.disabled = True
+            if self.message:
+                await self.message.edit(view=self)
+        except Exception:
+            pass
 
     async def on_timeout(self):
         try:
@@ -1083,7 +1506,7 @@ class CountryWizard(disnake.ui.View):
             self.draft.continent = existing.get("continent") or None
             self.draft.territory_km2 = existing.get("territory_km2")
             self.draft.population = existing.get("population")
-            self.draft.license_role_id = existing.get("license_role_id")
+            self.draft.license_id = existing.get("license_id")
             if existing.get("sea_access") is not None:
                 self.draft.sea_access = bool(int(existing["sea_access"]))
 
@@ -1114,7 +1537,8 @@ class CountryWizard(disnake.ui.View):
         progress = "  ".join(f"{nums[i]} {_chip(ok)}" for i, ok in enumerate(steps_ok))
         e.description = f"Прогресс: {progress}"
 
-        lic_str = f"<@&{self.draft.license_role_id}>" if self.draft.license_role_id else "—"
+        guild_id = self.ctx.guild.id if self.ctx.guild else 0
+        lic_str = format_license_name(guild_id, self.draft.license_id)
         e.add_field(
             name="Параметры страны",
             value="\n".join([
@@ -1187,20 +1611,23 @@ class CountryWizard(disnake.ui.View):
     
     @disnake.ui.button(label="Лицензия", style=disnake.ButtonStyle.secondary, custom_id="step_license", row=1)
     async def _open_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        async def on_pick(role_id: int, i: disnake.MessageInteraction):
-            self.draft.license_role_id = role_id
-            # Обновим главное сообщение мастера
+        licenses = list_licenses(inter.guild.id)
+
+        async def on_pick(license_id: Optional[int], i: disnake.MessageInteraction):
+            self.draft.license_id = license_id
             if self.message:
                 with contextlib.suppress(Exception):
                     await self.message.edit(embed=self.build_embed(), view=self)
 
         emb = build_license_pick_embed(
             invoker=inter.user,
-            title="Выбор роли лицензии для страны",
-            current_role_id=self.draft.license_role_id
+            guild_id=inter.guild.id,
+            title="Выбор лицензии для страны",
+            current_license_id=self.draft.license_id,
+            has_licenses=bool(licenses),
         )
 
-        picker = LicenseRolePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
+        picker = LicensePickView(self.ctx, licenses, on_pick=on_pick, current_license_id=self.draft.license_id)
         try:
             await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
         except Exception:
@@ -1236,13 +1663,13 @@ class CountryWizard(disnake.ui.View):
             population=d.population,
             sea_access=bool(d.sea_access),
             actor_id=inter.user.id,
-            license_role_id=self.draft.license_role_id
+            license_id=self.draft.license_id
         )
         if not ok:
             return await inter.response.send_message(embed=error_embed("Не удалось сохранить", err or "Неизвестная ошибка."), ephemeral=True)
 
         title = "✅ Страна создана" if d.editing_code is None else "✅ Изменения сохранены"
-        lic_txt = f"<@&{d.license_role_id}>" if d.license_role_id else "—"
+        lic_txt = format_license_name(inter.guild.id, d.license_id)
         done = disnake.Embed(title=title, color=disnake.Color.green())
         done.set_author(name=self.ctx.author.display_name, icon_url=self.ctx.author.display_avatar.url)
         done.description = (
@@ -1436,6 +1863,7 @@ class CountryListView(disnake.ui.View):
             e.set_footer(text=f"Страница {self.page+1}/{self.max_page+1}")
             return e
 
+        license_map = get_license_name_map(self.ctx.guild.id)
         blocks = []
         for r in chunk:
             uid = r.get("registered_user_id")
@@ -1443,7 +1871,8 @@ class CountryListView(disnake.ui.View):
             if uid:
                 m = self.ctx.guild.get_member(int(uid))
                 user_txt = (m.mention if m else f"<@{uid}>")
-            lic_txt = f"<@&{int(r['license_role_id'])}>" if r.get("license_role_id") else "—"
+            lic_txt = license_map.get(int(r["license_id"])) if r.get("license_id") else None
+            lic_txt = lic_txt or "—"
             sea = _fmt_bool(bool(r.get("sea_access"))) if r.get("sea_access") is not None else "—"
             blocks.append(
                 "\n".join([
@@ -1544,7 +1973,7 @@ async def reg_country_cmd(ctx: commands.Context, member: disnake.Member, code: s
     e.add_field(name="Население", value=f"{format_number(info.get('population') or 0)}", inline=True)
     sea = _fmt_bool(bool(info.get("sea_access"))) if info.get("sea_access") is not None else "—"
     e.add_field(name="Выход в море", value=sea, inline=True)
-    lic_txt = f"<@&{int(info['license_role_id'])}>" if info.get("license_role_id") else "—"
+    lic_txt = format_license_name(ctx.guild.id, info.get("license_id"))
     e.add_field(name="Лицензия", value=lic_txt, inline=True)
     await ctx.send(embed=e)
 
@@ -1556,17 +1985,11 @@ async def reg_country_cmd(ctx: commands.Context, member: disnake.Member, code: s
         await member.edit(nick=desired, reason="Регистрация на страну")
 
     # Выдача лицензии страны
-    lic_id = info.get("license_role_id")
+    lic_id = info.get("license_id")
     if lic_id:
-        role = ctx.guild.get_role(int(lic_id))
-        if role:
-            can, why = _bot_can_apply(ctx.guild, role, member)
-            if can:
-                with contextlib.suppress(Exception):
-                    await member.add_roles(role, reason="Регистрация на страну — выдача лицензии страны")
-            else:
-                # Не критично: просто сообщим в консоль/лог
-                print(f"[reg-country] Не удалось выдать роль лицензии: {why}")
+        ok_lic, err_lic = grant_license(ctx.guild.id, member.id, int(lic_id), ctx.author.id)
+        if not ok_lic and err_lic:
+            print(f"[reg-country] Не удалось выдать лицензию: {err_lic}")
 
 @bot.command(name="unreg-country")
 async def unreg_country_cmd(ctx: commands.Context, member: disnake.Member):
@@ -1580,6 +2003,12 @@ async def unreg_country_cmd(ctx: commands.Context, member: disnake.Member):
     e = disnake.Embed(title="✅ Снятие с страны", description=f"{member.mention} снят(а) с регистрации.", color=disnake.Color.green())
     if code:
         e.set_footer(text=f"Код страны: {code}")
+        info = country_get_by_code_or_name(ctx.guild.id, code)
+        if info and info.get("license_id"):
+            lic_id = int(info["license_id"])
+            ok_lic, err_lic = revoke_license(ctx.guild.id, member.id, lic_id)
+            if not ok_lic and err_lic:
+                print(f"[unreg-country] Не удалось отозвать лицензию: {err_lic}")
     await ctx.send(embed=e)
     
 @bot.command(name="country-user")
@@ -1599,7 +2028,7 @@ async def country_user_cmd(ctx: commands.Context, member: disnake.Member):
     if not info:
         return await ctx.send(embed=error_embed("Ошибка", "Данные страны не найдены."))
     sea = _fmt_bool(bool(info.get("sea_access"))) if info.get("sea_access") is not None else "—"
-    lic_txt = f"<@&{int(info['license_role_id'])}>" if info.get("license_role_id") else "—"
+    lic_txt = format_license_name(ctx.guild.id, info.get("license_id"))
     e = disnake.Embed(
         title=f"Страна пользователя {member.display_name}",
         description="\n".join([
@@ -1659,7 +2088,7 @@ def setup_shop_tables():
     addcol("roles_granted_on_buy", "roles_granted_on_buy TEXT")
     addcol("roles_removed_on_buy", "roles_removed_on_buy TEXT")
     addcol("disallow_sell", "disallow_sell INTEGER DEFAULT 0")
-    addcol("license_role_id", "license_role_id INTEGER")  # <<< НОВОЕ
+    addcol("license_id", "license_id INTEGER")  # <<< НОВОЕ
 
     c.execute("""
         CREATE TABLE IF NOT EXISTS item_shop_state (
@@ -1716,7 +2145,7 @@ def _item_row_to_dict(row) -> Optional[dict]:
         "roles_granted_on_buy": parse_roles_field(row[15]),
         "roles_removed_on_buy": parse_roles_field(row[16]),
         "disallow_sell": int(row[17] or 0),
-        "license_role_id": None if row[18] is None else int(row[18]),
+        "license_id": None if row[18] is None else int(row[18]),
     }
 
 ROLE_ID_FINDER = re.compile(r"\d+")
@@ -1830,7 +2259,7 @@ def get_item_by_name(guild_id: int, name: str) -> Optional[dict]:
             id, guild_id, name, name_lower, price, sell_price, description,
             buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
             per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_id
         FROM items
         WHERE guild_id = ? AND name_lower = ?
     """, (guild_id, (name or "").strip().lower()))
@@ -1860,7 +2289,7 @@ def list_items_db(guild_id: int) -> list[dict]:
             id, guild_id, name, name_lower, price, sell_price, description,
             buy_price_type, cost_items, is_listed, stock_total, restock_per_day,
             per_user_daily_limit, roles_required_buy, roles_required_sell,
-            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id
+            roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_id
         FROM items
         WHERE guild_id = ?
         ORDER BY name_lower
@@ -1926,7 +2355,7 @@ ITEMS_COLUMNS = (
     "id, guild_id, name, name_lower, price, sell_price, description, "
     "buy_price_type, cost_items, is_listed, stock_total, restock_per_day, "
     "per_user_daily_limit, roles_required_buy, roles_required_sell, "
-    "roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_role_id"
+    "roles_granted_on_buy, roles_removed_on_buy, disallow_sell, license_id"
 )
 
 def search_items_by_name_or_id(guild_id: int, query: str) -> list[dict]:
@@ -2278,26 +2707,16 @@ def parse_role_ids_from_text(guild: disnake.Guild, text: str) -> list[int]:
             ids.add(role.id)
     return sorted(ids)
 
-def license_block_embed(item: dict, role: Optional[disnake.Role]) -> disnake.Embed:
-    mention = role.mention if role else (f"<@&{int(item['license_role_id'])}>" if item.get('license_role_id') else "—")
+def license_block_embed(item: dict, license_name: Optional[str]) -> disnake.Embed:
+    lic_txt = f"«{license_name}»" if license_name else "неизвестная лицензия"
     return disnake.Embed(
         title="Покупка недоступна",
         description=(
-            f"Для покупки предмета «{item.get('name', 'Без названия')}» требуется лицензия {mention}.\n"
-            f"Для получения лицензии обращайтесь к её владельцу."
+            f"Для покупки предмета «{item.get('name', 'Без названия')}» требуется лицензия {lic_txt}.\n"
+            f"Для получения лицензии обратитесь к её владельцу."
         ),
         color=disnake.Color.orange()
     )
-
-def user_has_item_license(member: disnake.Member, item: dict) -> bool:
-    lic_id = item.get("license_role_id")
-    if not lic_id:
-        return True
-    try:
-        lic_id = int(lic_id)
-    except Exception:
-        return True  # некорректная настройка, не блокируем
-    return any(r.id == lic_id for r in member.roles)
 
 class ShopView(disnake.ui.View):
     def __init__(self, ctx: commands.Context, items: list[dict]):
@@ -2475,6 +2894,457 @@ class ShopView(disnake.ui.View):
             pass
 
 
+class LicenseCreateModal(disnake.ui.Modal):
+    def __init__(self, parent_view: "LicenseCreateView"):
+        components = [
+            disnake.ui.TextInput(
+                label="Название лицензии",
+                custom_id="license_name",
+                style=disnake.TextInputStyle.short,
+                max_length=LICENSE_NAME_MAX_LEN,
+                required=True,
+            )
+        ]
+        super().__init__(title="Создание лицензии", components=components)
+        self.parent_view = parent_view
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        name = inter.text_values.get("license_name", "")
+        if not inter.guild:
+            return await inter.response.send_message(embed=error_embed("Ошибка", "Лицензии доступны только на сервере."), ephemeral=True)
+        ok, err, lic = create_license(inter.guild.id, name, inter.user.id)
+        if not ok:
+            return await inter.response.send_message(embed=error_embed("Не удалось создать", err or "Ошибка"), ephemeral=True)
+
+        success = disnake.Embed(
+            title="✅ Лицензия создана",
+            description=f"Лицензия **{lic['name']}** успешно добавлена.",
+            color=disnake.Color.green(),
+        )
+        creator = inter.guild.get_member(lic.get("created_by"))
+        if creator:
+            success.add_field(name="Создатель", value=creator.mention, inline=False)
+        success.add_field(name="Создана", value=format_timestamp_full(lic.get("created_ts")), inline=False)
+        await inter.response.send_message(embed=success, ephemeral=True)
+        await self.parent_view.on_created(lic)
+
+
+class LicenseCreateView(disnake.ui.View):
+    def __init__(self, ctx: commands.Context):
+        super().__init__(timeout=180)
+        self.ctx = ctx
+        self.message: Optional[disnake.Message] = None
+        self._completed = False
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.ctx.author.id:
+            await inter.response.send_message("Эта панель доступна только инициатору.", ephemeral=True)
+            return False
+        if not inter.guild:
+            await inter.response.send_message("Доступно только на сервере.", ephemeral=True)
+            return False
+        return True
+
+    def _disable_all(self):
+        for child in self.children:
+            if isinstance(child, (disnake.ui.Button, disnake.ui.SelectBase)):
+                child.disabled = True
+
+    async def on_created(self, license_data: dict):
+        self._completed = True
+        self._disable_all()
+        embed = disnake.Embed(
+            title="✅ Лицензия создана",
+            description=f"Название: **{license_data['name']}**",
+            color=disnake.Color.green(),
+        )
+        creator = self.ctx.guild.get_member(license_data.get("created_by")) if self.ctx.guild else None
+        if creator:
+            embed.add_field(name="Создатель", value=creator.mention, inline=False)
+        embed.add_field(name="Создана", value=format_timestamp_full(license_data.get("created_ts")), inline=False)
+        if self.message:
+            await self.message.edit(embed=embed, view=self)
+
+    @disnake.ui.button(label="Создать", style=disnake.ButtonStyle.primary, custom_id="license_create_start")
+    async def _open_modal(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        await inter.response.send_modal(LicenseCreateModal(self))
+
+    @disnake.ui.button(label="Отмена", style=disnake.ButtonStyle.secondary, custom_id="license_create_cancel")
+    async def _cancel(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
+        self._disable_all()
+        cancel = disnake.Embed(title="Отменено", description="Создание лицензии отменено.", color=disnake.Color.red())
+        if self.message:
+            await self.message.edit(embed=cancel, view=self)
+        await inter.response.defer()
+
+    async def on_timeout(self):
+        if self._completed:
+            return
+        self._disable_all()
+        if self.message:
+            with contextlib.suppress(Exception):
+                await self.message.edit(view=self)
+
+
+class LicenseDeleteView(disnake.ui.View):
+    def __init__(self, ctx: commands.Context, licenses: list[dict]):
+        super().__init__(timeout=180)
+        self.ctx = ctx
+        self.message: Optional[disnake.Message] = None
+        self.licenses = licenses
+        self._selected_id: Optional[int] = None
+
+        options = [disnake.SelectOption(label=lic["name"][:100], value=str(lic["id"])) for lic in licenses[:25]]
+        self.select = disnake.ui.StringSelect(
+            custom_id="license_delete_select",
+            placeholder="Выберите лицензию для удаления",
+            options=options,
+            min_values=1,
+            max_values=1,
+        )
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+
+        self.btn_confirm = disnake.ui.Button(label="Удалить", style=disnake.ButtonStyle.danger, custom_id="license_delete_confirm")
+        self.btn_confirm.callback = self._on_confirm
+        self.add_item(self.btn_confirm)
+
+        self.btn_cancel = disnake.ui.Button(label="Отмена", style=disnake.ButtonStyle.secondary, custom_id="license_delete_cancel")
+        self.btn_cancel.callback = self._on_cancel
+        self.add_item(self.btn_cancel)
+
+    async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
+        if inter.user.id != self.ctx.author.id:
+            await inter.response.send_message("Эта панель доступна только инициатору.", ephemeral=True)
+            return False
+        if not inter.guild:
+            await inter.response.send_message("Доступно только на сервере.", ephemeral=True)
+            return False
+        return True
+
+    async def _on_select(self, inter: disnake.MessageInteraction):
+        value = self.select.values[0] if self.select.values else None
+        if value:
+            try:
+                self._selected_id = int(value)
+            except ValueError:
+                self._selected_id = None
+        await inter.response.defer()
+
+    async def _on_confirm(self, inter: disnake.MessageInteraction):
+        if self._selected_id is None:
+            return await inter.response.send_message("Сначала выберите лицензию.", ephemeral=True)
+        ok, err = delete_license(inter.guild.id, self._selected_id)
+        if not ok:
+            return await inter.response.send_message(embed=error_embed("Не удалось удалить", err or "Ошибка"), ephemeral=True)
+        self._disable_all()
+        name = next((lic["name"] for lic in self.licenses if lic["id"] == self._selected_id), "—")
+        embed = disnake.Embed(
+            title="🗑️ Лицензия удалена",
+            description=f"Лицензия **{name}** удалена. Связанные предметы и страны обновлены.",
+            color=disnake.Color.orange(),
+        )
+        if self.message:
+            await self.message.edit(embed=embed, view=self)
+        await inter.response.send_message(embed=embed, ephemeral=True)
+
+    async def _on_cancel(self, inter: disnake.MessageInteraction):
+        self._disable_all()
+        if self.message:
+            await self.message.edit(embed=disnake.Embed(title="Отменено", color=disnake.Color.red()), view=self)
+        await inter.response.defer()
+
+    def _disable_all(self):
+        for child in self.children:
+            if isinstance(child, (disnake.ui.Button, disnake.ui.SelectBase)):
+                child.disabled = True
+
+    async def on_timeout(self):
+        self._disable_all()
+        if self.message:
+            with contextlib.suppress(Exception):
+                await self.message.edit(view=self)
+
+
+@bot.command(name="create-lic")
+async def create_license_cmd(ctx: commands.Context):
+    if not await ensure_allowed_ctx(ctx, ALLOWED_LICENSE_CREATE):
+        return
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+
+    view = LicenseCreateView(ctx)
+    embed = disnake.Embed(
+        title="Создание новой лицензии",
+        description=(
+            "Нажмите кнопку «Создать», чтобы ввести название лицензии.\n"
+            "Название должно быть уникальным для сервера."
+        ),
+        color=disnake.Color.blurple(),
+    )
+    embed.set_footer(text=f"Максимальная длина названия — {LICENSE_NAME_MAX_LEN} символов")
+    msg = await ctx.send(embed=embed, view=view)
+    view.message = msg
+
+
+@bot.command(name="delete-lic")
+async def delete_license_cmd(ctx: commands.Context):
+    if not await ensure_allowed_ctx(ctx, ALLOWED_LICENSE_DELETE):
+        return
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+
+    licenses = list_licenses(ctx.guild.id)
+    if not licenses:
+        return await ctx.send(embed=error_embed("Удаление лицензии", "На сервере нет лицензий."))
+
+    view = LicenseDeleteView(ctx, licenses)
+    embed = disnake.Embed(
+        title="Удаление лицензии",
+        description="Выберите лицензию в меню ниже и подтвердите удаление.",
+        color=disnake.Color.red(),
+    )
+    if len(licenses) > 25:
+        embed.set_footer(text="Отображаются только первые 25 лицензий.")
+    msg = await ctx.send(embed=embed, view=view)
+    view.message = msg
+
+
+def _license_overview_embed(guild: disnake.Guild, licenses: list[dict]) -> disnake.Embed:
+    embed = disnake.Embed(title="Список лицензий", color=disnake.Color.blurple())
+    embed.set_author(name=guild.name, icon_url=getattr(guild.icon, "url", None))
+    if not licenses:
+        embed.description = "На сервере ещё нет лицензий."
+        return embed
+    lines = []
+    for lic in licenses:
+        creator = guild.get_member(lic.get("created_by"))
+        creator_txt = creator.mention if creator else (f"<@{lic['created_by']}>" if lic.get("created_by") else "—")
+        lines.append(
+            "\n".join([
+                f"• **{lic['name']}**",
+                f"  Создана: {format_timestamp_full(lic.get('created_ts'))}",
+                f"  Создатель: {creator_txt}",
+            ])
+        )
+    embed.description = "\n\n".join(lines)
+    return embed
+
+@bot.command(name="mylic")
+async def my_license_cmd(ctx: commands.Context):
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    data = get_user_licenses(ctx.guild.id, ctx.author.id)
+    embed = disnake.Embed(title="Мои лицензии", color=disnake.Color.blurple())
+    embed.set_author(name=ctx.author.display_name, icon_url=ctx.author.display_avatar.url)
+    if not data:
+        embed.description = "У вас нет активных лицензий."
+    else:
+        lines = []
+        for lic in data:
+            granter = ctx.guild.get_member(lic.get("granted_by")) if ctx.guild else None
+            granter_txt = granter.mention if granter else (f"<@{lic['granted_by']}>" if lic.get("granted_by") else "—")
+            lines.append(
+                f"• **{lic['name']}** — выдана {format_timestamp_full(lic.get('granted_ts'))} (выдал {granter_txt})"
+            )
+        embed.description = "\n".join(lines)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="lic-user")
+async def license_user_cmd(ctx: commands.Context, member: disnake.Member):
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    data = get_user_licenses(ctx.guild.id, member.id)
+    embed = disnake.Embed(title=f"Лицензии {member.display_name}", color=disnake.Color.blurple())
+    embed.set_author(name=ctx.guild.name, icon_url=getattr(ctx.guild.icon, "url", None))
+    if not data:
+        embed.description = "У пользователя нет активных лицензий."
+    else:
+        lines = []
+        for lic in data:
+            granter = ctx.guild.get_member(lic.get("granted_by")) if ctx.guild else None
+            granter_txt = granter.mention if granter else (f"<@{lic['granted_by']}>" if lic.get("granted_by") else "—")
+            lines.append(
+                f"• **{lic['name']}** — выдана {format_timestamp_full(lic.get('granted_ts'))} (выдал {granter_txt})"
+            )
+        embed.description = "\n".join(lines)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="lic-list")
+async def license_list_cmd(ctx: commands.Context):
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    licenses = list_licenses(ctx.guild.id)
+    embed = _license_overview_embed(ctx.guild, licenses)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="lic-info")
+async def license_info_cmd(ctx: commands.Context, *, license_name: str):
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    lic, error = await resolve_license_by_user_query(
+        ctx,
+        license_name,
+        prompt_title="Выбор лицензии",
+        no_matches_title="Лицензия не найдена",
+        no_matches_description="Совпадения отсутствуют. Уточните название и попробуйте снова.",
+    )
+    if not lic:
+        title, description = error if error else ("Лицензия не найдена", "Не удалось определить лицензию.")
+        return await ctx.send(embed=error_embed(title, description))
+    holders = get_license_holders(ctx.guild.id, lic["id"])
+    embed = disnake.Embed(
+        title=f"Информация о лицензии «{lic['name']}»",
+        color=disnake.Color.blurple(),
+    )
+    creator = ctx.guild.get_member(lic.get("created_by")) if ctx.guild else None
+    creator_txt = creator.mention if creator else (f"<@{lic['created_by']}>" if lic.get("created_by") else "—")
+    embed.add_field(name="Создатель", value=creator_txt, inline=False)
+    embed.add_field(name="Создана", value=format_timestamp_full(lic.get("created_ts")), inline=False)
+    if not holders:
+        embed.description = "У этой лицензии пока нет держателей."
+    else:
+        lines = []
+        for h in holders:
+            user = ctx.guild.get_member(h["user_id"]) if ctx.guild else None
+            user_txt = user.mention if user else f"<@{h['user_id']}>"
+            granter = ctx.guild.get_member(h.get("granted_by")) if ctx.guild else None
+            granter_txt = granter.mention if granter else (f"<@{h['granted_by']}>" if h.get("granted_by") else "—")
+            lines.append(
+                f"• {user_txt} — с {format_timestamp_full(h.get('granted_ts'))} (выдал {granter_txt})"
+            )
+        embed.description = "\n".join(lines)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="give-lic")
+async def give_license_cmd(ctx: commands.Context, member: disnake.Member, *, license_name: str):
+    if not await ensure_allowed_ctx(ctx, ALLOWED_LICENSE_GIVE):
+        return
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    lic, error = await resolve_license_by_user_query(
+        ctx,
+        license_name,
+        prompt_title="Выбор лицензии для выдачи",
+        no_matches_title="Лицензия не найдена",
+        no_matches_description="Совпадения отсутствуют. Уточните название и попробуйте снова.",
+    )
+    if not lic:
+        title, description = error if error else ("Лицензия не найдена", "Не удалось определить лицензию.")
+        return await ctx.send(embed=error_embed(title, description))
+    now_ts = int(time.time())
+    ok, err = grant_license(ctx.guild.id, member.id, lic["id"], ctx.author.id)
+    if not ok:
+        return await ctx.send(embed=error_embed("Не удалось выдать", err or "Ошибка"))
+    embed = disnake.Embed(
+        title="✅ Лицензия выдана",
+        description=f"{member.mention} теперь имеет лицензию **{lic['name']}**.",
+        color=disnake.Color.green(),
+    )
+    embed.add_field(name="Дата", value=format_timestamp_full(now_ts), inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="take-lic")
+async def take_license_cmd(ctx: commands.Context, member: disnake.Member, *, license_name: str):
+    if not await ensure_allowed_ctx(ctx, ALLOWED_LICENSE_TAKE):
+        return
+    if not ctx.guild:
+        return await ctx.send("Команда доступна только на сервере.")
+    lic, error = await resolve_license_by_user_query(
+        ctx,
+        license_name,
+        prompt_title="Выбор лицензии для отзыва",
+        no_matches_title="Лицензия не найдена",
+        no_matches_description="Совпадения отсутствуют. Уточните название и попробуйте снова.",
+    )
+    if not lic:
+        title, description = error if error else ("Лицензия не найдена", "Не удалось определить лицензию.")
+        return await ctx.send(embed=error_embed(title, description))
+    ok, err = revoke_license(ctx.guild.id, member.id, lic["id"])
+    if not ok:
+        return await ctx.send(embed=error_embed("Не удалось отозвать", err or "Ошибка"))
+
+
+@bot.command(name="clear")
+async def clear_messages_cmd(ctx: commands.Context, amount: int, member: Optional[disnake.Member] = None):
+    if not await ensure_allowed_ctx(ctx, ALLOWED_CLEAR_MESSAGES):
+        return
+    if not ctx.guild:
+        return await ctx.send(embed=error_embed("Команда недоступна", "Эту команду можно использовать только на сервере."))
+    if amount <= 0:
+        return await ctx.send(embed=error_embed("Некорректное количество", "Укажите положительное количество сообщений для удаления."))
+    if amount > 100:
+        return await ctx.send(embed=error_embed("Слишком много", "За один раз можно удалить не более 100 сообщений."))
+
+    command_message = ctx.message
+    try:
+        await command_message.delete()
+    except disnake.Forbidden:
+        pass
+    except disnake.HTTPException:
+        pass
+
+    deleted_count = 0
+    try:
+        if member is not None:
+            to_delete: list[disnake.Message] = []
+            async for message in ctx.channel.history(limit=1000):
+                if message.id == command_message.id:
+                    continue
+                if message.author.id != member.id:
+                    continue
+                to_delete.append(message)
+                if len(to_delete) >= amount:
+                    break
+            if to_delete:
+                if len(to_delete) == 1:
+                    await to_delete[0].delete()
+                    deleted_count = 1
+                else:
+                    try:
+                        await ctx.channel.delete_messages(to_delete)
+                    except disnake.HTTPException:
+                        for message in to_delete:
+                            try:
+                                await message.delete()
+                            except disnake.HTTPException:
+                                continue
+                            else:
+                                deleted_count += 1
+                    else:
+                        deleted_count = len(to_delete)
+        else:
+            def skip_command(msg: disnake.Message) -> bool:
+                return msg.id != command_message.id
+
+            purged = await ctx.channel.purge(limit=amount + 1, check=skip_command)
+            deleted_count = len(purged)
+    except disnake.Forbidden:
+        return await ctx.send(embed=error_embed("Нет доступа", "У бота недостаточно прав для удаления сообщений."))
+    except disnake.HTTPException as exc:
+        return await ctx.send(embed=error_embed("Ошибка", f"Не удалось удалить сообщения: {exc}"))
+
+    if member is not None:
+        if deleted_count:
+            description = f"Удалено {deleted_count} сообщений пользователя {member.mention}."
+        else:
+            description = f"Не найдено сообщений пользователя {member.mention} для удаления."
+    else:
+        description = f"Удалено {deleted_count} сообщений."
+
+    embed = disnake.Embed(
+        title="🧹 Очистка чата",
+        description=description,
+        color=disnake.Color.green() if deleted_count else disnake.Color.orange(),
+    )
+    await ctx.send(embed=embed, delete_after=5)
+
+
 @bot.command(name="shop", aliases=["Shop", "SHOP", "Магазин", "магазин", "МАГАЗИН"])
 async def shop_cmd(ctx: commands.Context, page: int = 1):
     """Открыть меню магазина."""
@@ -2517,7 +3387,7 @@ class ItemDraft:
     roles_required_sell: list[int] = field(default_factory=list)
     roles_granted_on_buy: list[int] = field(default_factory=list)
     roles_removed_on_buy: list[int] = field(default_factory=list)
-    license_role_id: Optional[int] = None   # <<< НОВОЕ
+    license_id: Optional[int] = None   # <<< НОВОЕ
 
 
 # Предполагается, что у тебя есть эти функции для работы с БД
@@ -3023,7 +3893,7 @@ class CreateItemWizard(disnake.ui.View):
             self.draft.editing_item_id = int(item_to_edit.get("id")) if item_to_edit.get("id") is not None else None
             self.draft.name = item_to_edit.get("name") or ""
             self.draft.description = item_to_edit.get("description") or ""
-            self.draft.license_role_id = item_to_edit.get("license_role_id")
+            self.draft.license_id = item_to_edit.get("license_id")
             
             # Продажа (!sell)
             self.draft.disallow_sell = int(item_to_edit.get("disallow_sell") or 0)
@@ -3199,7 +4069,7 @@ class CreateItemWizard(disnake.ui.View):
             ),
             inline=False
         )
-        lic_txt = f"<@&{self.draft.license_role_id}>" if self.draft.license_role_id else "—"
+        lic_txt = format_license_name(self.ctx.guild.id, self.draft.license_id)
         e.add_field(
             name="🔖 Лицензия",
             value=f"Лицензия: {lic_txt}",
@@ -3247,19 +4117,23 @@ class CreateItemWizard(disnake.ui.View):
 
     @disnake.ui.button(label="Лицензия", style=disnake.ButtonStyle.secondary, custom_id="step_license", row=3)
     async def _open_license(self, btn: disnake.ui.Button, inter: disnake.MessageInteraction):
-        async def on_pick(role_id: int, i: disnake.MessageInteraction):
-            self.draft.license_role_id = role_id
+        licenses = list_licenses(inter.guild.id)
+
+        async def on_pick(license_id: Optional[int], i: disnake.MessageInteraction):
+            self.draft.license_id = license_id
             if self.message:
                 with contextlib.suppress(Exception):
                     await self.message.edit(embed=self.build_embed(), view=self)
 
         emb = build_license_pick_embed(
             invoker=inter.user,
-            title="Выбор роли лицензии для предмета",
-            current_role_id=self.draft.license_role_id
+            guild_id=inter.guild.id,
+            title="Выбор лицензии для предмета",
+            current_license_id=self.draft.license_id,
+            has_licenses=bool(licenses),
         )
 
-        picker = LicenseRolePickView(self.ctx, on_pick=on_pick, current_role_id=self.draft.license_role_id)
+        picker = LicensePickView(self.ctx, licenses, on_pick=on_pick, current_license_id=self.draft.license_id)
         try:
             await inter.response.send_message(embed=emb, view=picker, ephemeral=True)
         except Exception:
@@ -3319,7 +4193,7 @@ class CreateItemWizard(disnake.ui.View):
 
             is_listed_val = safe_int(1 if self.draft.is_listed else 0, name="Публикация", min_v=0, max_v=1)
             disallow_sell_val = safe_int(self.draft.disallow_sell, name="Запрет продажи", min_v=0, max_v=1)
-            license_role_id_val = safe_optional_int(self.draft.license_role_id, name="Лицензия (роль)", min_v=0)
+            license_id_val = safe_optional_int(self.draft.license_id, name="Лицензия", min_v=0)
 
             editing_item_id_val = None
             if self.draft.editing_item_id:
@@ -3340,7 +4214,7 @@ class CreateItemWizard(disnake.ui.View):
                         buy_price_type = ?, cost_items = ?, is_listed = ?, stock_total = ?, 
                         restock_per_day = ?, per_user_daily_limit = ?, roles_required_buy = ?, 
                         roles_required_sell = ?, roles_granted_on_buy = ?, roles_removed_on_buy = ?, 
-                        disallow_sell = ?, license_role_id = ?
+                        disallow_sell = ?, license_id = ?
                     WHERE id = ? AND guild_id = ?
                 """, (
                     self.draft.name, self.draft.name.lower(), price_val, sell_price_val, self.draft.description,
@@ -3350,7 +4224,7 @@ class CreateItemWizard(disnake.ui.View):
                     csv_from_ids(self.draft.roles_required_sell) or None,
                     csv_from_ids(self.draft.roles_granted_on_buy) or None,
                     csv_from_ids(self.draft.roles_removed_on_buy) or None,
-                    disallow_sell_val, license_role_id_val,
+                    disallow_sell_val, license_id_val,
                     editing_item_id_val, guild_id_val
                 ))
                 conn.commit()
@@ -3375,7 +4249,7 @@ class CreateItemWizard(disnake.ui.View):
                     csv_from_ids(self.draft.roles_required_sell) or None,
                     csv_from_ids(self.draft.roles_granted_on_buy) or None,
                     csv_from_ids(self.draft.roles_removed_on_buy) or None,
-                    disallow_sell_val, license_role_id_val
+                    disallow_sell_val, license_id_val
                 ))
                 conn.commit()
                 item_id = c.lastrowid
@@ -4003,26 +4877,16 @@ async def buy_cmd(ctx: commands.Context, *, raw: str):
         ))
 
     # ——— НОВОЕ: проверка лицензии предмета ———
-    lic_id = item.get("license_role_id")
+    lic_id = item.get("license_id")
     if lic_id is not None:
         try:
             lic_id = int(lic_id)
         except Exception:
             lic_id = None
-    if lic_id:
-        has_license = any(r.id == lic_id for r in ctx.author.roles)
-        if not has_license:
-            lic_role = ctx.guild.get_role(lic_id)
-            mention = lic_role.mention if lic_role else f"<@&{lic_id}>"
-            emb = disnake.Embed(
-                title="Покупка недоступна",
-                description=(
-                    f"Для покупки предмета «{item.get('name', 'Без названия')}» требуется лицензия {mention}.\n"
-                    f"Для получения лицензии обращайтесь к её владельцу."
-                ),
-                color=disnake.Color.orange()
-            )
-            return await ctx.send(embed=emb)
+    if lic_id and not user_has_license(ctx.guild.id, ctx.author.id, lic_id):
+        lic_name = format_license_name(ctx.guild.id, lic_id)
+        emb = license_block_embed(item, None if lic_name == "—" else lic_name)
+        return await ctx.send(embed=emb)
     # ——— конец проверки лицензии ———
 
     ensure_item_state(ctx.guild.id, item)
@@ -4258,18 +5122,7 @@ async def item_info_cmd(ctx: commands.Context, *, name: str):
         inline=False
     )
     
-    lic_val = "—"
-    try:
-        # item тут — нормализованный dict, но license может отсутствовать; достанем сырцом
-        conn = sqlite3.connect(get_db_path())
-        c = conn.cursor()
-        c.execute("SELECT license_role_id FROM items WHERE guild_id=? AND id=?", (ctx.guild.id, item["id"]))
-        row = c.fetchone()
-        conn.close()
-        if row and row[0]:
-            lic_val = f"<@&{int(row[0])}>"
-    except:
-        pass
+    lic_val = format_license_name(ctx.guild.id, item.get("license_id"))
     embed.add_field(name="🔖 Лицензия", value=lic_val, inline=True)
 
     embed.set_footer(text=f"ID: {item['id']} • Купите: !buy [кол-во] {item['name']}")
