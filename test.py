@@ -7,6 +7,7 @@ import time
 import json
 import asyncio
 import contextlib
+import inspect
 import re
 import math
 from difflib import SequenceMatcher
@@ -685,6 +686,24 @@ async def resolve_license_by_user_query(
         await prompt_message.delete()
 
     return None, ("Время истекло", "Не удалось выбрать лицензию вовремя. Попробуйте снова.")
+
+
+def resolve_license_direct(guild_id: int, query: str) -> Optional[dict]:
+    raw = (query or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        lic = get_license_by_id(guild_id, int(raw))
+        if lic:
+            return lic
+    normalized = normalize_license_name(raw)
+    if not normalized:
+        return None
+    if normalized.isdigit():
+        lic = get_license_by_id(guild_id, int(normalized))
+        if lic:
+            return lic
+    return get_license_by_name(guild_id, normalized)
 
 
 def format_timestamp_full(ts: Optional[int]) -> str:
@@ -1380,6 +1399,7 @@ def build_license_pick_embed(
     if has_licenses:
         description_lines.append("Выберите нужную лицензию из списка ниже и подтвердите выбор.")
         description_lines.append("Чтобы снять требование, выберите пункт «Без лицензии».")
+        description_lines.append("Можно листать страницы и использовать поиск для фильтрации вариантов.")
     else:
         description_lines.append("На сервере пока нет созданных лицензий. Используйте команду !create-lic.")
     e = disnake.Embed(
@@ -1391,22 +1411,72 @@ def build_license_pick_embed(
     return e
 
 
+class LicenseSearchModal(disnake.ui.Modal):
+    def __init__(self, view: "LicensePickView"):
+        self.view = view
+        components = [
+            disnake.ui.TextInput(
+                label="Название лицензии",
+                custom_id="license_search_query",
+                placeholder="Введите часть названия...",
+                max_length=100,
+                required=False,
+            )
+        ]
+        super().__init__(
+            title="Поиск лицензии",
+            components=components,
+            custom_id="license_search_modal",
+        )
+
+    async def callback(self, inter: disnake.ModalInteraction):
+        query = inter.text_values.get("license_search_query", "")
+        await self.view.apply_filter(inter, query)
+
+
 class LicensePickView(disnake.ui.View):
-    """Универсальный выбор лицензии через StringSelect."""
+    """Универсальный выбор лицензии с поддержкой фильтра и пагинации."""
     
     def __init__(
         self,
         ctx: commands.Context,
         licenses: list[dict],
         on_pick,
+        *,
         current_license_id: Optional[int] = None,
         timeout: float = 120.0,
+        allow_no_license: bool = True,
+        page_size: int = 24,
+        enable_overview: bool = False,
+        overview_title: Optional[str] = None,
+        overview_per_page: Optional[int] = None,
+        overview_description_prefix: Optional[str] = None,
+        on_cancel=None,
+        on_timeout_callback=None,
+        initial_filter: Optional[str] = None,
     ):
         super().__init__(timeout=timeout)
         self.ctx = ctx
         self.on_pick = on_pick
         self.current_license_id = current_license_id
+        self.allow_no_license = allow_no_license
+        self.on_cancel_callback = on_cancel
+        self.on_timeout_callback = on_timeout_callback
         self.message: Optional[disnake.Message] = None
+        self._page_size = max(1, min(24, int(page_size)))
+        self._overview_enabled = enable_overview
+        self._overview_title = overview_title
+        self._overview_per_page = max(1, min(24, int(overview_per_page or self._page_size)))
+        self._overview_description_prefix = (
+            overview_description_prefix.strip() if overview_description_prefix else None
+        )
+        self._current_page = 0
+        self._total_pages = 1
+        self._filter_query_raw: Optional[str] = None
+        self._filter_query_norm: Optional[str] = None
+        self._filtered_cache: list[dict] = []
+        self._last_overview_embed: Optional[disnake.Embed] = None
+        self._has_real_options: bool = False
         self._all_licenses = sorted(licenses, key=lambda lic: (lic.get("name") or "").lower())
         self._chosen_license_id: Optional[int] = current_license_id
         try:
@@ -1415,14 +1485,16 @@ class LicensePickView(disnake.ui.View):
         except (TypeError, ValueError):
             self._chosen_license_id = None
 
-        options = self._build_options()
+        self._set_filter(initial_filter)
+
+        placeholder_option = disnake.SelectOption(label="Загрузка...", value="__placeholder__")
         self.license_select = disnake.ui.StringSelect(
             custom_id="license_pick_select",
-            placeholder="Начните вводить название лицензии",
+            placeholder="Загрузка...",
             min_values=1,
             max_values=1,
             row=0,
-            options=options,
+            options=[placeholder_option],
         )
 
         self.btn_confirm = disnake.ui.Button(
@@ -1437,97 +1509,307 @@ class LicensePickView(disnake.ui.View):
             custom_id="license_pick_cancel",
             row=1,
         )
+        
+        self.btn_prev_page = disnake.ui.Button(
+            style=disnake.ButtonStyle.secondary,
+            emoji="◀️",
+            custom_id="license_pick_prev",
+            row=2,
+        )
+        self.btn_next_page = disnake.ui.Button(
+            style=disnake.ButtonStyle.secondary,
+            emoji="▶️",
+            custom_id="license_pick_next",
+            row=2,
+        )
+        self.btn_search = disnake.ui.Button(
+            style=disnake.ButtonStyle.secondary,
+            label="Поиск",
+            emoji="🔎",
+            custom_id="license_pick_search",
+            row=2,
+        )
+        self.btn_clear_filter = disnake.ui.Button(
+            style=disnake.ButtonStyle.secondary,
+            label="Сброс",
+            custom_id="license_pick_clear",
+            row=2,
+        )
 
         self.license_select.callback = self._on_select
         self.btn_confirm.callback = self._on_confirm
         self.btn_cancel.callback = self._on_cancel
+        self.btn_prev_page.callback = self._on_prev_page
+        self.btn_next_page.callback = self._on_next_page
+        self.btn_search.callback = self._on_search
+        self.btn_clear_filter.callback = self._on_clear_filter
 
         self.add_item(self.license_select)
         self.add_item(self.btn_confirm)
         self.add_item(self.btn_cancel)
+        self.add_item(self.btn_prev_page)
+        self.add_item(self.btn_next_page)
+        self.add_item(self.btn_search)
+        self.add_item(self.btn_clear_filter)
 
         self._refresh_select_state()
 
-    def _build_options(self) -> list[disnake.SelectOption]:
-        options: list[disnake.SelectOption] = [
-            disnake.SelectOption(
-                label="Без лицензии",
-                value="none",
-                description="Снять требование лицензии",
-                default=self._chosen_license_id is None,
-            )
-        ]
+    def _set_filter(self, raw_query: Optional[str]):
+        normalized = normalize_license_name(raw_query or "")
+        if not normalized:
+            self._filter_query_raw = None
+            self._filter_query_norm = None
+        else:
+            self._filter_query_raw = normalized
+            self._filter_query_norm = normalized.lower()
+        self._current_page = 0
+
+    def _filtered_licenses(self) -> list[dict]:
+        if not self._filter_query_norm:
+            return list(self._all_licenses)
+        result: list[dict] = []
+        for lic in self._all_licenses:
+            name_lower = str(lic.get("name_lower") or lic.get("name") or "").lower()
+            if self._filter_query_norm in name_lower:
+                result.append(lic)
+        return result
+
+    def _build_placeholder(self, total_pages: int, has_real_options: bool) -> str:
+        if not has_real_options:
+            if self._filter_query_raw:
+                return "Совпадений не найдено"
+            return "Нет доступных лицензий"
+        parts: list[str] = []
+        if total_pages > 1:
+            parts.append(f"Стр. {self._current_page + 1}/{total_pages}")
+        if self._filter_query_raw:
+            parts.append(f"Фильтр: {self._filter_query_raw}")
+        if not parts:
+            return "Выберите лицензию"
+        placeholder = " • ".join(parts)
+        return placeholder[:100]
+
+    def _refresh_select_state(self) -> Optional[disnake.Embed]:
+        filtered = self._filtered_licenses()
+        self._filtered_cache = filtered
+        total_items = len(filtered)
+        total_pages = max(1, math.ceil(total_items / self._page_size)) if total_items else 1
+        if self._current_page >= total_pages:
+            self._current_page = max(0, total_pages - 1)
+            
         if self._chosen_license_id is not None and not any(
-            str(lic.get("id")) == str(self._chosen_license_id) for lic in self._all_licenses
+            str(lic.get("id")) == str(self._chosen_license_id) for lic in filtered
         ):
             self._chosen_license_id = None
 
-        display_pool = list(self._all_licenses)
-        if self._chosen_license_id is not None:
-            chosen = next(
-                (lic for lic in display_pool if str(lic.get("id")) == str(self._chosen_license_id)),
-                None,
+        start = self._current_page * self._page_size
+        end = start + self._page_size
+        page_items = filtered[start:end]
+        self._has_real_options = bool(page_items)
+
+        options: list[disnake.SelectOption] = []
+        if self.allow_no_license:
+            options.append(
+                disnake.SelectOption(
+                    label="Без лицензии",
+                    value="none",
+                    description="Снять требование лицензии",
+                    default=self._chosen_license_id is None,
+                )
             )
-            if chosen:
-                display_pool.remove(chosen)
-                display_pool.insert(0, chosen)
-        for lic in display_pool[:24]:
+        for lic in page_items:
             name = str(lic.get("name") or f"ID {lic.get('id')}")[:100]
             options.append(
                 disnake.SelectOption(
                     label=name,
                     value=str(lic.get("id")),
-                    default=str(self._chosen_license_id) == str(lic.get("id")),
+                    default=self._chosen_license_id is not None
+                    and str(self._chosen_license_id) == str(lic.get("id")),
                 )
             )
-        return options
 
-    def _refresh_select_state(self):
-        options = self._build_options()
+        if not page_items and not self.allow_no_license:
+            options.append(
+                disnake.SelectOption(
+                    label="Совпадений нет",
+                    value="no_results",
+                    description="Измените фильтр, чтобы увидеть лицензии",
+                )
+            )
+
         self.license_select.options = options
-        if len(options) == 1:
+
+        placeholder = self._build_placeholder(total_pages, self._has_real_options)
+        self.license_select.placeholder = placeholder
+
+        if not self.allow_no_license and not self._has_real_options:
             self.license_select.disabled = True
             self.license_select.placeholder = "Нет доступных лицензий"
         else:
-            self.license_select.disabled = False
-            if len(self._all_licenses) > 24:
-                self.license_select.placeholder = (
-                    f"Показаны первые 24 из {len(self._all_licenses)}. Начните вводить название лицензии"
+            self.btn_confirm.disabled = True
+            self.btn_confirm.disabled = False
+
+        self.btn_prev_page.disabled = total_pages <= 1 or self._current_page <= 0
+        self.btn_next_page.disabled = total_pages <= 1 or self._current_page >= total_pages - 1
+        self.btn_clear_filter.disabled = not bool(self._filter_query_raw)
+
+        embed: Optional[disnake.Embed] = None
+        if self._overview_enabled and self.ctx.guild:
+            embed = _license_overview_embed(
+                self.ctx.guild,
+                filtered,
+                page=self._current_page,
+                per_page=self._overview_per_page,
+            )
+            if self._overview_title:
+                embed.title = self._overview_title
+            if self._filter_query_raw:
+                footer_text = getattr(embed.footer, "text", "") or ""
+                filter_txt = f"Фильтр: {self._filter_query_raw}"
+                embed.set_footer(
+                    text=f"{footer_text} • {filter_txt}" if footer_text else filter_txt
                 )
-            else:
-                self.license_select.placeholder = "Начните вводить название лицензии"
+            if self._overview_description_prefix:
+                base_desc = embed.description or ""
+                prefix = self._overview_description_prefix
+                embed.description = f"{prefix}\n\n{base_desc}" if base_desc else prefix
+        self._last_overview_embed = embed
+        self._total_pages = total_pages
+        return embed
+
+    def get_overview_embed(self) -> Optional[disnake.Embed]:
+        return self._last_overview_embed
 
     async def _on_select(self, inter: disnake.MessageInteraction):
         value = self.license_select.values[0] if self.license_select.values else None
-        if value == "none":
+        if value == "none" and self.allow_no_license:
             self._chosen_license_id = None
-        elif value is not None:
+        elif value and value != "no_results":
             try:
                 self._chosen_license_id = int(value)
             except ValueError:
                 self._chosen_license_id = None
-        self._refresh_select_state()
-        await inter.response.defer()
+        embed = self._refresh_select_state()
+        if embed is not None:
+            await inter.response.edit_message(embed=embed, view=self)
+        else:
+            await inter.response.edit_message(view=self)
 
     async def _on_confirm(self, inter: disnake.MessageInteraction):
-        if self._chosen_license_id is None and (self.license_select.disabled and self.current_license_id is None):
-            return await inter.response.send_message("На сервере нет лицензий для выбора.", ephemeral=True)
-        await self.on_pick(self._chosen_license_id, inter)
+        if self._chosen_license_id is None and not self.allow_no_license:
+            await inter.response.send_message("Сначала выберите лицензию из списка.", ephemeral=True)
+            return
+        if self._chosen_license_id is None and self.allow_no_license and not self._has_real_options:
+            # Нет лицензий на сервере
+            await inter.response.send_message("На сервере нет лицензий для выбора.", ephemeral=True)
+            return
+        await inter.response.defer()
+        followup_payload = await self.on_pick(self._chosen_license_id, inter)
         chosen_name = format_license_name(
             inter.guild.id if inter.guild else self.ctx.guild.id,
             self._chosen_license_id,
         )
         msg = f"✅ Выбрана лицензия: {chosen_name}"
         try:
-            await inter.response.edit_message(content=msg, view=None, embed=None)
+            await inter.edit_original_message(content=msg, view=None, embed=None)
         except Exception:
-            await inter.followup.send(msg, ephemeral=True)
+            with contextlib.suppress(Exception):
+                await inter.followup.send(msg, ephemeral=True)
+        if followup_payload:
+            await self._send_followup(inter, followup_payload)
+        self.stop()
+
+    async def _send_followup(self, inter: disnake.MessageInteraction, payload):
+        if not isinstance(payload, dict):
+            return
+        kwargs: dict = {}
+        content = payload.get("content")
+        embed = payload.get("embed")
+        embeds = payload.get("embeds")
+        if embed and embeds:
+            embeds = embeds + [embed]
+        elif embed and not embeds:
+            kwargs["embed"] = embed
+        elif embeds:
+            kwargs["embeds"] = embeds
+        if embeds and "embeds" not in kwargs:
+            kwargs["embeds"] = embeds
+        if content:
+            kwargs["content"] = content
+        if payload.get("view"):
+            kwargs["view"] = payload["view"]
+        if payload.get("allowed_mentions"):
+            kwargs["allowed_mentions"] = payload["allowed_mentions"]
+        if payload.get("file"):
+            kwargs["file"] = payload["file"]
+        if payload.get("files"):
+            kwargs["files"] = payload["files"]
+        kwargs["ephemeral"] = bool(payload.get("ephemeral"))
+        if not kwargs:
+            return
+        with contextlib.suppress(Exception):
+            await inter.followup.send(**kwargs)
 
     async def _on_cancel(self, inter: disnake.MessageInteraction):
         try:
             await inter.response.edit_message(content="Отменено.", view=None, embed=None)
         except Exception:
             await inter.followup.send("Отменено.", ephemeral=True)
+        await self._maybe_call(self.on_cancel_callback, inter)
+        self.stop()
+
+    async def _change_page(self, inter: disnake.MessageInteraction, delta: int):
+        if self._total_pages <= 1 and not self._filter_query_raw:
+            await inter.response.defer()
+            return
+        new_page = max(0, min(self._total_pages - 1, self._current_page + delta))
+        if new_page == self._current_page:
+            await inter.response.defer()
+            return
+        self._current_page = new_page
+        embed = self._refresh_select_state()
+        if embed is not None:
+            await inter.response.edit_message(embed=embed, view=self)
+        else:
+            await inter.response.edit_message(view=self)
+
+    async def _on_prev_page(self, inter: disnake.MessageInteraction):
+        await self._change_page(inter, -1)
+
+    async def _on_next_page(self, inter: disnake.MessageInteraction):
+        await self._change_page(inter, 1)
+
+    async def _on_search(self, inter: disnake.MessageInteraction):
+        await inter.response.send_modal(LicenseSearchModal(self))
+
+    async def _on_clear_filter(self, inter: disnake.MessageInteraction):
+        if not self._filter_query_raw:
+            await inter.response.defer()
+            return
+        self._set_filter(None)
+        embed = self._refresh_select_state()
+        if embed is not None:
+            await inter.response.edit_message(embed=embed, view=self)
+        else:
+            await inter.response.edit_message(view=self)
+
+    async def apply_filter(self, inter: disnake.Interaction, query: str):
+        self._set_filter(query)
+        embed = self._refresh_select_state()
+        if embed is not None:
+            await inter.response.edit_message(embed=embed, view=self)
+        else:
+            await inter.response.edit_message(view=self)
+
+    async def _maybe_call(self, callback, *args, **kwargs):
+        if not callback:
+            return
+        try:
+            result = callback(*args, **kwargs)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            pass
 
     async def interaction_check(self, inter: disnake.MessageInteraction) -> bool:
         if inter.user.id != self.ctx.author.id:
@@ -1544,6 +1826,7 @@ class LicensePickView(disnake.ui.View):
                 await self.message.edit(view=self)
         except Exception:
             pass
+        await self._maybe_call(self.on_timeout_callback)
 
 class CountryWizard(disnake.ui.View):
     def __init__(self, ctx: commands.Context, existing: Optional[dict] = None):
@@ -3476,53 +3759,167 @@ async def license_info_cmd(ctx: commands.Context, *, license_name: str):
 
 
 @bot.command(name="give-lic")
-async def give_license_cmd(ctx: commands.Context, member: disnake.Member, *, license_name: str):
+async def give_license_cmd(ctx: commands.Context, member: disnake.Member, *, license_name: Optional[str] = None):
     if not await ensure_allowed_ctx(ctx, ALLOWED_LICENSE_GIVE):
         return
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    lic, error = await resolve_license_by_user_query(
+    licenses = list_licenses(ctx.guild.id)
+    if not licenses:
+        return await ctx.send(embed=error_embed("Нет лицензий", "На сервере ещё не создано лицензий."))
+
+    selected_license: Optional[dict] = None
+    info_prefix: Optional[str] = None
+    initial_filter: Optional[str] = None
+
+    if license_name:
+        selected_license = resolve_license_direct(ctx.guild.id, license_name)
+        if not selected_license:
+            initial_filter = normalize_license_name(license_name)
+            info_prefix = (
+                f"Лицензия «{license_name}» не найдена. Выберите подходящую из списка ниже,"
+                " чтобы выдать её пользователю."
+            )
+
+    if selected_license:
+        now_ts = int(time.time())
+        ok, err = grant_license(ctx.guild.id, member.id, selected_license["id"], ctx.author.id)
+        if not ok:
+            return await ctx.send(embed=error_embed("Не удалось выдать", err or "Ошибка"))
+        embed = disnake.Embed(
+            title="✅ Лицензия выдана",
+            description=f"{member.mention} теперь имеет лицензию **{selected_license['name']}**.",
+            color=disnake.Color.green(),
+        )
+        embed.add_field(name="Дата", value=format_timestamp_full(now_ts), inline=False)
+        return await ctx.send(embed=embed)
+
+    description_prefix = info_prefix or (
+        f"Выберите лицензию, которую нужно выдать пользователю {member.mention}, и подтвердите выбор."
+    )
+
+    async def on_pick(license_id: Optional[int], inter: disnake.MessageInteraction):
+        if license_id is None:
+            return {"content": "Лицензия не выбрана.", "ephemeral": True}
+        ok, err = grant_license(ctx.guild.id, member.id, license_id, ctx.author.id)
+        if not ok:
+            return {
+                "embed": error_embed("Не удалось выдать", err or "Ошибка"),
+                "ephemeral": True,
+            }
+        now_ts = int(time.time())
+        lic_info = get_license_by_id(ctx.guild.id, license_id)
+        lic_name = lic_info["name"] if lic_info else format_license_name(ctx.guild.id, license_id)
+        embed = disnake.Embed(
+            title="✅ Лицензия выдана",
+            description=f"{member.mention} теперь имеет лицензию **{lic_name}**.",
+            color=disnake.Color.green(),
+        )
+        embed.add_field(name="Дата", value=format_timestamp_full(now_ts), inline=False)
+        return {"embed": embed}
+
+    view = LicensePickView(
         ctx,
-        license_name,
-        prompt_title="Выбор лицензии для выдачи",
-        no_matches_title="Лицензия не найдена",
-        no_matches_description="Совпадения отсутствуют. Уточните название и попробуйте снова.",
+        licenses,
+        on_pick=on_pick,
+        allow_no_license=False,
+        page_size=15,
+        enable_overview=True,
+        overview_title=f"Лицензии сервера — выдача",
+        overview_per_page=15,
+        overview_description_prefix=description_prefix,
+        initial_filter=initial_filter,
     )
-    if not lic:
-        title, description = error if error else ("Лицензия не найдена", "Не удалось определить лицензию.")
-        return await ctx.send(embed=error_embed(title, description))
-    now_ts = int(time.time())
-    ok, err = grant_license(ctx.guild.id, member.id, lic["id"], ctx.author.id)
-    if not ok:
-        return await ctx.send(embed=error_embed("Не удалось выдать", err or "Ошибка"))
-    embed = disnake.Embed(
-        title="✅ Лицензия выдана",
-        description=f"{member.mention} теперь имеет лицензию **{lic['name']}**.",
-        color=disnake.Color.green(),
+    embed = view.get_overview_embed() or disnake.Embed(
+        title="Список лицензий",
+        description=description_prefix,
+        color=disnake.Color.blurple(),
     )
-    embed.add_field(name="Дата", value=format_timestamp_full(now_ts), inline=False)
-    await ctx.send(embed=embed)
+    if embed.description and description_prefix not in embed.description:
+        embed.description = f"{description_prefix}\n\n{embed.description}"
+    embed.color = disnake.Color.blurple()
+    msg = await ctx.send(embed=embed, view=view)
+    view.message = msg
 
 
 @bot.command(name="take-lic")
-async def take_license_cmd(ctx: commands.Context, member: disnake.Member, *, license_name: str):
+async def take_license_cmd(ctx: commands.Context, member: disnake.Member, *, license_name: Optional[str] = None):
     if not await ensure_allowed_ctx(ctx, ALLOWED_LICENSE_TAKE):
         return
     if not ctx.guild:
         return await ctx.send("Команда доступна только на сервере.")
-    lic, error = await resolve_license_by_user_query(
-        ctx,
-        license_name,
-        prompt_title="Выбор лицензии для отзыва",
-        no_matches_title="Лицензия не найдена",
-        no_matches_description="Совпадения отсутствуют. Уточните название и попробуйте снова.",
+    licenses = list_licenses(ctx.guild.id)
+    if not licenses:
+        return await ctx.send(embed=error_embed("Нет лицензий", "На сервере ещё не создано лицензий."))
+
+    selected_license: Optional[dict] = None
+    info_prefix: Optional[str] = None
+    initial_filter: Optional[str] = None
+
+    if license_name:
+        selected_license = resolve_license_direct(ctx.guild.id, license_name)
+        if not selected_license:
+            initial_filter = normalize_license_name(license_name)
+            info_prefix = (
+                f"Лицензия «{license_name}» не найдена. Выберите подходящую из списка ниже,"
+                " чтобы отозвать её у пользователя."
+            )
+
+    if selected_license:
+        ok, err = revoke_license(ctx.guild.id, member.id, selected_license["id"])
+        if not ok:
+            return await ctx.send(embed=error_embed("Не удалось отозвать", err or "Ошибка"))
+        embed = disnake.Embed(
+            title="✅ Лицензия отозвана",
+            description=f"У {member.mention} больше нет лицензии **{selected_license['name']}**.",
+            color=disnake.Color.orange(),
+        )
+        return await ctx.send(embed=embed)
+
+    description_prefix = info_prefix or (
+        f"Выберите лицензию, которую нужно отозвать у пользователя {member.mention}, и подтвердите выбор."
     )
-    if not lic:
-        title, description = error if error else ("Лицензия не найдена", "Не удалось определить лицензию.")
-        return await ctx.send(embed=error_embed(title, description))
-    ok, err = revoke_license(ctx.guild.id, member.id, lic["id"])
-    if not ok:
-        return await ctx.send(embed=error_embed("Не удалось отозвать", err or "Ошибка"))
+
+    async def on_pick(license_id: Optional[int], inter: disnake.MessageInteraction):
+        if license_id is None:
+            return {"content": "Лицензия не выбрана.", "ephemeral": True}
+        ok, err = revoke_license(ctx.guild.id, member.id, license_id)
+        if not ok:
+            return {
+                "embed": error_embed("Не удалось отозвать", err or "Ошибка"),
+                "ephemeral": True,
+            }
+        lic_info = get_license_by_id(ctx.guild.id, license_id)
+        lic_name = lic_info["name"] if lic_info else format_license_name(ctx.guild.id, license_id)
+        embed = disnake.Embed(
+            title="✅ Лицензия отозвана",
+            description=f"У {member.mention} больше нет лицензии **{lic_name}**.",
+            color=disnake.Color.orange(),
+        )
+        return {"embed": embed}
+
+    view = LicensePickView(
+        ctx,
+        licenses,
+        on_pick=on_pick,
+        allow_no_license=False,
+        page_size=15,
+        enable_overview=True,
+        overview_title="Лицензии сервера — отзыв",
+        overview_per_page=15,
+        overview_description_prefix=description_prefix,
+        initial_filter=initial_filter,
+    )
+    embed = view.get_overview_embed() or disnake.Embed(
+        title="Список лицензий",
+        description=description_prefix,
+        color=disnake.Color.blurple(),
+    )
+    if embed.description and description_prefix not in embed.description:
+        embed.description = f"{description_prefix}\n\n{embed.description}"
+    embed.color = disnake.Color.blurple()
+    msg = await ctx.send(embed=embed, view=view)
+    view.message = msg
 
 
 @bot.command(name="clear")
